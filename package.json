@@ -1,0 +1,26 @@
+{
+  "name": "heic-decode-pure-js",
+  "version": "0.1.0",
+  "description": "Pure TypeScript HEIC/HEIF/AVIF decoder (input: binary, output: ImageBitmap/ImageData)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc && node tools/fix-declarations.mjs",
+    "test": "node --experimental-strip-types tools/run-tests.ts",
+    "test:fuzz": "node --experimental-strip-types tools/fuzz-smoke.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

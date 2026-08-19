@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>HEIC / AVIF decoder browser smoke test</title>
+<style>
+  body { font: 14px system-ui; margin: 24px; color: #18202a; }
+  canvas { display: block; margin-top: 12px; border: 1px solid #ccd3dc; }
+</style>
+<h1>HEIC / AVIF decoder browser smoke test</h1>
+<pre id="result">running…</pre>
+<div id="outputs"></div>
+<script type="module">
+  import decode from '../dist/index.js';
+
+  const result = document.querySelector('#result');
+  try {
+    const cases = [];
+    const fixtures = [
+      { file: 'heic_a.heic', opaque: true },
+      { file: 'avif_a_nocdef.avif', opaque: true },
+      { file: 'avif_c_10.avif', opaque: true },
+      { file: 'heif_grid.heic.b64', base64: true, opaque: true },
+      { file: 'heif_prem.heic.b64', base64: true, opaque: false },
+      { file: 'avif_12bit.avif.b64', base64: true, opaque: true },
+    ];
+    for (const fixture of fixtures) {
+      const response = await fetch(`../testimages/${fixture.file}`);
+      let binary;
+      if (fixture.base64) {
+        const encoded = (await response.text()).replace(/\s/g, '');
+        const decoded = atob(encoded);
+        binary = Uint8Array.from(decoded, character => character.charCodeAt(0));
+      } else binary = await response.arrayBuffer();
+      const bitmap = await decode(binary);
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext('2d');
+      context.drawImage(bitmap, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      let nonTransparent = 0, checksum = 2166136261;
+      for (let offset = 0; offset < pixels.length; offset += 4) {
+        if (pixels[offset + 3]) nonTransparent++;
+        for (let component = 0; component < 4; component++) {
+          checksum = Math.imul(checksum ^ pixels[offset + component], 16777619) >>> 0;
+        }
+      }
+      document.querySelector('#outputs').append(canvas);
+      const pixelsOk = nonTransparent > 0 && (!fixture.opaque || nonTransparent === bitmap.width * bitmap.height);
+      cases.push({ file: fixture.file, ok: bitmap instanceof ImageBitmap && pixelsOk,
+        type: bitmap.constructor.name, width: bitmap.width, height: bitmap.height,
+        nonTransparent, checksum });
+    }
+    window.smokeResult = {
+      ok: cases.every(test => test.ok && test.checksum !== 0),
+      cases,
+    };
+    result.textContent = JSON.stringify(window.smokeResult, null, 2);
+  } catch (error) {
+    window.smokeResult = { ok: false, error: String(error), stack: error?.stack };
+    result.textContent = JSON.stringify(window.smokeResult, null, 2);
+  }
+</script>
