@@ -1,5 +1,10 @@
 /** Resource limits applied while parsing and decoding untrusted image data. */
 export interface DecodeOptions {
+  /**
+   * Optional exact-size RGBA8 destination reused by decodeToRgba. Its length
+   * must equal decoded width * height * 4 and it must not overlap the input.
+   */
+  output?: Uint8ClampedArray;
   /** Maximum width or height of any decoded/derived image. Default: 65,536. */
   maxDimension?: number;
   /** Maximum pixels in one decoded/derived image. Default: 64 Mi pixels. */

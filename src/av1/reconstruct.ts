@@ -19,6 +19,8 @@ const SMOOTH_H_PRED = 11;
 const PAETH_PRED = 12;
 const CFL_PRED = 13;
 const FILTER_PRED = 13;
+const MAX_PREDICTION_EDGE = 256;
+const MAX_TRANSFORM_AREA = 64 * 64;
 
 const FILTER_INTRA_TAPS = [
   [[-6, 10, 0, 0, 0, 12, 0], [-5, 2, 10, 0, 0, 9, 0], [-3, 1, 1, 10, 0, 7, 0], [-3, 1, 1, 2, 10, 5, 0],
@@ -42,14 +44,47 @@ interface ReconstructionContext {
   masks: ReconstructionMask[];
   smoothMasks: ReconstructionMask[];
   max: number;
+  scratch: ReconstructionScratch;
 }
 
 interface ReconstructionMask {
   data: Uint8Array;
   width: number;
   height: number;
+  stride: number;
   originX: number;
   originY: number;
+}
+
+interface EdgeSamples {
+  top: Uint16Array;
+  left: Uint16Array;
+  topLeft: number;
+  haveTop: boolean;
+  haveLeft: boolean;
+  length: number;
+}
+
+interface DirectionalEdge {
+  values: Int32Array;
+  offset: number;
+  length: number;
+  get(index: number): number;
+  set(index: number, value: number): void;
+}
+
+interface ReconstructionScratch {
+  coefficients: Int32Array;
+  residual: Int32Array;
+  top: Uint16Array;
+  left: Uint16Array;
+  edges: EdgeSamples;
+  filterInputs: Int32Array;
+  directionalTop: DirectionalEdge;
+  directionalLeft: DirectionalEdge;
+  edgeFilterCopy: Int32Array;
+  edgeUpsampleCopy: Int32Array;
+  cflAc: Int32Array;
 }
 
 export interface ReconstructionBounds {
@@ -67,6 +102,7 @@ export function reconstructAv1Frame(
     masks: planes.map((plane, index) => createReconstructionMask(plane, sequence, index, bounds)),
     smoothMasks: planes.map((plane, index) => createReconstructionMask(plane, sequence, index, bounds)),
     max: (1 << sequence.bitDepth) - 1,
+    scratch: createReconstructionScratch(),
   };
   for (const block of blocks) reconstructBlock(context, block);
 }
@@ -76,8 +112,9 @@ function createReconstructionMask(
   bounds?: ReconstructionBounds,
 ): ReconstructionMask {
   if (!bounds) {
-    return { data: new Uint8Array(plane.width * plane.height), width: plane.width, height: plane.height,
-      originX: 0, originY: 0 };
+    const stride = (plane.width + 7) >> 3;
+    return { data: new Uint8Array(stride * plane.height), width: plane.width, height: plane.height,
+      stride, originX: 0, originY: 0 };
   }
   const shiftX = planeIndex ? sequence.subsamplingX : 0;
   const shiftY = planeIndex ? sequence.subsamplingY : 0;
@@ -86,7 +123,41 @@ function createReconstructionMask(
   const endX = Math.min(plane.width, ((bounds.endX + (1 << shiftX) - 1) >> shiftX) * 4);
   const endY = Math.min(plane.height, ((bounds.endY + (1 << shiftY) - 1) >> shiftY) * 4);
   const width = Math.max(0, endX - originX), height = Math.max(0, endY - originY);
-  return { data: new Uint8Array(width * height), width, height, originX, originY };
+  const stride = (width + 7) >> 3;
+  return { data: new Uint8Array(stride * height), width, height, stride, originX, originY };
+}
+
+function createReconstructionScratch(): ReconstructionScratch {
+  const top = new Uint16Array(MAX_PREDICTION_EDGE);
+  const left = new Uint16Array(MAX_PREDICTION_EDGE);
+  return {
+    coefficients: new Int32Array(MAX_TRANSFORM_AREA),
+    residual: new Int32Array(MAX_TRANSFORM_AREA),
+    top,
+    left,
+    edges: { top, left, topLeft: 0, haveTop: false, haveLeft: false, length: 0 },
+    filterInputs: new Int32Array(7),
+    directionalTop: createDirectionalEdge(),
+    directionalLeft: createDirectionalEdge(),
+    edgeFilterCopy: new Int32Array(MAX_PREDICTION_EDGE),
+    edgeUpsampleCopy: new Int32Array(MAX_PREDICTION_EDGE + 3),
+    cflAc: new Int32Array(0),
+  };
+}
+
+function createDirectionalEdge(): DirectionalEdge {
+  const edge: DirectionalEdge = {
+    values: new Int32Array(MAX_PREDICTION_EDGE * 2 + 8),
+    offset: 2,
+    length: 0,
+    get(index: number): number {
+      return edge.values[clip(index + edge.offset, 0, edge.length - 1)]!;
+    },
+    set(index: number, value: number): void {
+      edge.values[clip(index + edge.offset, 0, edge.length - 1)] = value;
+    },
+  };
+  return edge;
 }
 
 /** Apply the normative horizontal AV1 frame super-resolution filter. */
@@ -108,24 +179,66 @@ export function upscaleAv1Frame(
     const error = destination.width * step - (inputWidth << 14);
     const start = (Math.trunc((-(destination.width - inputWidth) * (1 << 13) +
       (destination.width >> 1)) / destination.width) + 128 - Math.trunc(error / 2)) & 0x3fff;
+    const sourceBases = new Int32Array(destination.width);
+    const filterOffsets = new Uint16Array(destination.width);
+    let phase = start, sourceX = -1;
+    for (let x = 0; x < destination.width; x++) {
+      sourceBases[x] = sourceX - 3;
+      filterOffsets[x] = (phase >> 8) * 8;
+      phase += step;
+      sourceX += phase >> 14;
+      phase &= 0x3fff;
+    }
+    let interiorStart = 0;
+    while (interiorStart < destination.width && sourceBases[interiorStart]! < 0) interiorStart++;
+    let interiorEnd = interiorStart;
+    while (interiorEnd < destination.width && sourceBases[interiorEnd]! + 7 < source.width) interiorEnd++;
+    const sourceData = source.data, destinationData = destination.data;
     for (let y = 0; y < source.height; y++) {
-      let phase = start, sourceX = -1;
       const sourceRow = y * source.stride, destinationRow = y * destination.stride;
-      for (let x = 0; x < destination.width; x++) {
-        const filterOffset = (phase >> 8) * 8;
+      for (let x = 0; x < interiorStart; x++) {
+        destinationData[destinationRow + x] = resizeBoundarySample(
+          sourceData, sourceRow, sourceBases[x]!, source.width, filterOffsets[x]!, maximum,
+        );
+      }
+      for (let x = interiorStart; x < interiorEnd; x++) {
+        const sourceIndex = sourceRow + sourceBases[x]!;
+        const filter = filterOffsets[x]!;
         let sum = 0;
-        for (let tap = 0; tap < 8; tap++) {
-          const sampleX = clip(sourceX + tap - 3, 0, source.width - 1);
-          sum -= resizeFilter[filterOffset + tap]! * source.data[sourceRow + sampleX]!;
-        }
-        destination.data[destinationRow + x] = clip((sum + 64) >> 7, 0, maximum);
-        phase += step;
-        sourceX += phase >> 14;
-        phase &= 0x3fff;
+        sum -= resizeFilter[filter]! * sourceData[sourceIndex]!;
+        sum -= resizeFilter[filter + 1]! * sourceData[sourceIndex + 1]!;
+        sum -= resizeFilter[filter + 2]! * sourceData[sourceIndex + 2]!;
+        sum -= resizeFilter[filter + 3]! * sourceData[sourceIndex + 3]!;
+        sum -= resizeFilter[filter + 4]! * sourceData[sourceIndex + 4]!;
+        sum -= resizeFilter[filter + 5]! * sourceData[sourceIndex + 5]!;
+        sum -= resizeFilter[filter + 6]! * sourceData[sourceIndex + 6]!;
+        sum -= resizeFilter[filter + 7]! * sourceData[sourceIndex + 7]!;
+        const value = (sum + 64) >> 7;
+        destinationData[destinationRow + x] = value < 0 ? 0 : value > maximum ? maximum : value;
+      }
+      for (let x = interiorEnd; x < destination.width; x++) {
+        destinationData[destinationRow + x] = resizeBoundarySample(
+          sourceData, sourceRow, sourceBases[x]!, source.width, filterOffsets[x]!, maximum,
+        );
       }
     }
   }
   return output;
+}
+
+function resizeBoundarySample(
+  data: Plane['data'], row: number, base: number, width: number, filter: number, maximum: number,
+): number {
+  let sum = 0;
+  sum -= resizeFilter[filter]! * data[row + clip(base, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 1]! * data[row + clip(base + 1, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 2]! * data[row + clip(base + 2, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 3]! * data[row + clip(base + 3, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 4]! * data[row + clip(base + 4, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 5]! * data[row + clip(base + 5, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 6]! * data[row + clip(base + 6, 0, width - 1)]!;
+  sum -= resizeFilter[filter + 7]! * data[row + clip(base + 7, 0, width - 1)]!;
+  return clip((sum + 64) >> 7, 0, maximum);
 }
 
 function reconstructBlock(context: ReconstructionContext, block: Av1DecodedBlock): void {
@@ -289,9 +402,10 @@ function intraPredict(
   predictionWidth = width, predictionHeight = height,
 ): void {
   const plane = context.planes[planeIndex]!;
-  const { top, left, topLeft, haveTop, haveLeft } = collectEdges(
+  const edges = collectEdges(
     context, planeIndex, x0, y0, predictionWidth, predictionHeight,
   );
+  const { top, left, topLeft, haveTop, haveLeft } = edges;
   const dst = plane.data;
   const stride = plane.stride;
   markSmooth(context, planeIndex, x0, y0, width, height,
@@ -299,7 +413,7 @@ function intraPredict(
 
   if (mode === FILTER_PRED) {
     filterIntraPredict(plane, x0, y0, width, height, predictionWidth, predictionHeight,
-      top, left, topLeft, angleDelta, context.max);
+      top, left, topLeft, angleDelta, context.max, context.scratch.filterInputs);
     return;
   }
 
@@ -331,7 +445,8 @@ function intraPredict(
   if (mode >= VERT_PRED && mode <= 8) {
     directionalPredict(plane, x0, y0, width, height, top, left, topLeft,
       MODE_ANGLES[mode - VERT_PRED]! + 3 * angleDelta, context.sequence.intraEdgeFilter,
-      haveTop, haveLeft, edgeFilterType, context.max, predictionWidth, predictionHeight);
+      haveTop, haveLeft, edgeFilterType, context.max, context.scratch,
+      predictionWidth, predictionHeight, edges.length);
     return;
   }
   if (mode === PAETH_PRED) {
@@ -370,6 +485,7 @@ function filterIntraPredict(
   plane: Plane, x0: number, y0: number, width: number, height: number,
   predictionWidth: number, predictionHeight: number,
   top: Uint16Array, left: Uint16Array, topLeft: number, filterIndex: number, max: number,
+  inputs: Int32Array,
 ): void {
   const taps = FILTER_INTRA_TAPS[Math.max(0, Math.min(4, filterIndex))]!;
   const data = plane.data, stride = plane.stride;
@@ -380,7 +496,6 @@ function filterIntraPredict(
       // two come from its left (or LeftCol for the first group column).
       // In particular, x>0 on y==0 still reads AboveRow[x-1], not a
       // non-existent reconstructed row at y0-1.
-      const inputs = new Int32Array(7);
       for (let input = 0; input < 5; input++) {
         if (y === 0) {
           const topIndex = x + input - 1;
@@ -411,7 +526,8 @@ function directionalPredict(
   plane: Plane, x0: number, y0: number, width: number, height: number,
   top: Uint16Array, left: Uint16Array, topLeft: number, angle: number,
   enableEdgeFilter: boolean, haveTop: boolean, haveLeft: boolean, smoothFilterType: number,
-  maximum: number, predictionWidth = width, predictionHeight = height,
+  maximum: number, scratch: ReconstructionScratch,
+  predictionWidth = width, predictionHeight = height, edgeLength = predictionWidth + predictionHeight,
 ): void {
   const dst = plane.data, stride = plane.stride;
   if (angle === 90) {
@@ -422,8 +538,8 @@ function directionalPredict(
     for (let y = 0; y < height; y++) dst.fill(left[y]!, (y0 + y) * stride + x0, (y0 + y) * stride + x0 + width);
     return;
   }
-  const topEdge = makeDirectionalEdge(top, topLeft);
-  const leftEdge = makeDirectionalEdge(left, topLeft);
+  const topEdge = prepareDirectionalEdge(scratch.directionalTop, top, edgeLength, topLeft);
+  const leftEdge = prepareDirectionalEdge(scratch.directionalLeft, left, edgeLength, topLeft);
   let upsampleTop = 0, upsampleLeft = 0;
   if (enableEdgeFilter) {
     if (angle !== 90 && angle !== 180) {
@@ -436,27 +552,33 @@ function directionalPredict(
           predictionWidth, predictionHeight, smoothFilterType, angle - 90,
         );
         const sampleCount = predictionWidth + (angle < 90 ? predictionHeight : 0) + 1;
-        filterIntraEdge(topEdge, sampleCount, strength);
+        filterIntraEdge(topEdge, sampleCount, strength, scratch.edgeFilterCopy);
       }
       if (haveLeft) {
         const strength = intraEdgeFilterStrength(
           predictionWidth, predictionHeight, smoothFilterType, angle - 180,
         );
         const sampleCount = predictionHeight + (angle > 180 ? predictionWidth : 0) + 1;
-        filterIntraEdge(leftEdge, sampleCount, strength);
+        filterIntraEdge(leftEdge, sampleCount, strength, scratch.edgeFilterCopy);
       }
     }
     upsampleTop = +shouldUpsampleIntraEdge(
       predictionWidth, predictionHeight, smoothFilterType, angle - 90,
     );
     if (upsampleTop) {
-      upsampleIntraEdge(topEdge, predictionWidth + (angle < 90 ? predictionHeight : 0), maximum);
+      upsampleIntraEdge(
+        topEdge, predictionWidth + (angle < 90 ? predictionHeight : 0), maximum,
+        scratch.edgeUpsampleCopy,
+      );
     }
     upsampleLeft = +shouldUpsampleIntraEdge(
       predictionWidth, predictionHeight, smoothFilterType, angle - 180,
     );
     if (upsampleLeft) {
-      upsampleIntraEdge(leftEdge, predictionHeight + (angle > 180 ? predictionWidth : 0), maximum);
+      upsampleIntraEdge(
+        leftEdge, predictionHeight + (angle > 180 ? predictionWidth : 0), maximum,
+        scratch.edgeUpsampleCopy,
+      );
     }
   }
 
@@ -532,7 +654,11 @@ function cflPredict(
 
   const luma = context.planes[0]!;
   const ssX = context.sequence.subsamplingX, ssY = context.sequence.subsamplingY;
-  const ac = new Int32Array(predictionWidth * predictionHeight);
+  const predictionArea = predictionWidth * predictionHeight;
+  if (context.scratch.cflAc.length < predictionArea) {
+    context.scratch.cflAc = new Int32Array(predictionArea);
+  }
+  const ac = context.scratch.cflAc;
   let average = 0;
   for (let y = 0; y < predictionHeight; y++) {
     for (let x = 0; x < predictionWidth; x++) {
@@ -550,7 +676,6 @@ function cflPredict(
       average += value;
     }
   }
-  const predictionArea = predictionWidth * predictionHeight;
   average = Math.floor((average + (predictionArea >> 1)) / predictionArea);
   for (let y = 0; y < height; y++) {
     const row = (y0 + y) * plane.stride + x0;
@@ -570,7 +695,9 @@ function addResidual(
   const info = transformSizes[tx]!;
   const width = info.w4 * 4, height = info.h4 * 4;
   const storedWidth = Math.min(width, 32), storedHeight = Math.min(height, 32);
-  const coefficients = new Int32Array(width * height);
+  const area = width * height;
+  const coefficients = context.scratch.coefficients;
+  coefficients.fill(0, 0, area);
   const q = quantizers(context, planeIndex, qIdx);
   const shift = Math.max(0, info.ctx - 2);
   const qmLevel = planeIndex === 0 ? context.header.qmY : planeIndex === 1 ? context.header.qmU : context.header.qmV;
@@ -588,6 +715,7 @@ function addResidual(
   }
   const residual = inverseTransform2d(
     coefficients, width, height, tx, result.txType, context.sequence.bitDepth,
+    context.scratch.residual,
   );
   const plane = context.planes[planeIndex]!;
   const outWidth = Math.min(width, plane.width - x0), outHeight = Math.min(height, plane.height - y0);
@@ -618,12 +746,13 @@ function signedDequant(token: number, step: number, shift: number): number {
 function collectEdges(
   context: ReconstructionContext, planeIndex: number,
   x0: number, y0: number, width: number, height: number,
-): { top: Uint16Array; left: Uint16Array; topLeft: number; haveTop: boolean; haveLeft: boolean } {
+): EdgeSamples {
   const plane = context.planes[planeIndex]!;
   const mask = context.masks[planeIndex]!;
   const extension = width + height;
-  const top = new Uint16Array(extension);
-  const left = new Uint16Array(extension);
+  const top = context.scratch.top;
+  const left = context.scratch.left;
+  if (extension > top.length) throw new RangeError('AV1 prediction edge exceeds scratch capacity');
   const haveTop = y0 > 0 && maskValue(mask, Math.min(x0, plane.width - 1), y0 - 1) !== 0;
   const haveLeft = x0 > 0 && maskValue(mask, x0 - 1, Math.min(y0, plane.height - 1)) !== 0;
   const midpoint = (context.max + 1) >> 1;
@@ -654,7 +783,12 @@ function collectEdges(
   if (haveTop && haveLeft && maskValue(mask, x0 - 1, y0 - 1)) topLeft = plane.data[(y0 - 1) * plane.stride + x0 - 1]!;
   else if (haveTop) topLeft = top[0]!;
   else if (haveLeft) topLeft = left[0]!;
-  return { top, left, topLeft, haveTop, haveLeft };
+  const edges = context.scratch.edges;
+  edges.topLeft = topLeft;
+  edges.haveTop = haveTop;
+  edges.haveLeft = haveLeft;
+  edges.length = extension;
+  return edges;
 }
 
 function mark(context: ReconstructionContext, plane: number, x0: number, y0: number, width: number, height: number): void {
@@ -680,8 +814,8 @@ function filterType(
 
 function maskValue(mask: ReconstructionMask, x: number, y: number): number {
   const localX = x - mask.originX, localY = y - mask.originY;
-  return localX < 0 || localY < 0 || localX >= mask.width || localY >= mask.height ? 0 :
-    mask.data[localY * mask.width + localX]!;
+  if (localX < 0 || localY < 0 || localX >= mask.width || localY >= mask.height) return 0;
+  return (mask.data[localY * mask.stride + (localX >> 3)]! >> (localX & 7)) & 1;
 }
 
 function fillMask(
@@ -693,7 +827,36 @@ function fillMask(
   const endY = Math.min(mask.height, y - mask.originY + height);
   if (startX >= endX || startY >= endY) return;
   for (let localY = startY; localY < endY; localY++) {
-    mask.data.fill(value, localY * mask.width + startX, localY * mask.width + endX);
+    fillMaskRow(mask.data, localY * mask.stride, startX, endX, value);
+  }
+}
+
+function fillMaskRow(
+  data: Uint8Array, row: number, start: number, end: number, value: number,
+): void {
+  const firstByte = start >> 3;
+  const lastByte = (end - 1) >> 3;
+  const firstBit = start & 7;
+  const endBit = end & 7;
+  if (firstByte === lastByte) {
+    const mask = ((0xff << firstBit) & (endBit ? (1 << endBit) - 1 : 0xff)) & 0xff;
+    const index = row + firstByte;
+    data[index] = value ? data[index]! | mask : data[index]! & ~mask;
+    return;
+  }
+  let fullStart = firstByte;
+  if (firstBit) {
+    const mask = (0xff << firstBit) & 0xff;
+    const index = row + firstByte;
+    data[index] = value ? data[index]! | mask : data[index]! & ~mask;
+    fullStart++;
+  }
+  const fullEnd = endBit ? lastByte : lastByte + 1;
+  if (fullStart < fullEnd) data.fill(value ? 0xff : 0, row + fullStart, row + fullEnd);
+  if (endBit) {
+    const mask = (1 << endBit) - 1;
+    const index = row + lastByte;
+    data[index] = value ? data[index]! | mask : data[index]! & ~mask;
   }
 }
 
@@ -709,29 +872,19 @@ function derivative(angle: number): number {
   return dr_intra_derivative[Math.max(0, Math.min(dr_intra_derivative.length - 1, angle >> 1))] ?? 0;
 }
 
-interface DirectionalEdge {
-  values: Int32Array;
-  offset: number;
-  get(index: number): number;
-  set(index: number, value: number): void;
-}
-
-function makeDirectionalEdge(input: Uint16Array, topLeft: number): DirectionalEdge {
-  const offset = 2;
-  const values = new Int32Array(input.length * 2 + 8);
-  values.fill(input[input.length - 1] ?? topLeft);
-  values[offset - 2] = topLeft;
-  values[offset - 1] = topLeft;
-  values.set(input, offset);
-  return {
-    values, offset,
-    get(index: number): number {
-      return values[clip(index + offset, 0, values.length - 1)]!;
-    },
-    set(index: number, value: number): void {
-      values[clip(index + offset, 0, values.length - 1)] = value;
-    },
-  };
+function prepareDirectionalEdge(
+  edge: DirectionalEdge, input: Uint16Array, inputLength: number, topLeft: number,
+): DirectionalEdge {
+  const length = inputLength * 2 + 8;
+  if (length > edge.values.length) throw new RangeError('AV1 directional edge exceeds scratch capacity');
+  edge.length = length;
+  edge.values.fill(input[inputLength - 1] ?? topLeft, 0, length);
+  edge.values[edge.offset - 2] = topLeft;
+  edge.values[edge.offset - 1] = topLeft;
+  for (let index = 0; index < inputLength; index++) {
+    edge.values[edge.offset + index] = input[index]!;
+  }
+  return edge;
 }
 
 function intraEdgeFilterStrength(width: number, height: number, type: number, delta: number): number {
@@ -756,11 +909,12 @@ function shouldUpsampleIntraEdge(width: number, height: number, type: number, de
   return type === 0 ? width + height <= 16 : width + height <= 8;
 }
 
-function filterIntraEdge(edge: DirectionalEdge, size: number, strength: number): void {
+function filterIntraEdge(
+  edge: DirectionalEdge, size: number, strength: number, copy: Int32Array,
+): void {
   if (!strength) return;
   const kernels = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]] as const;
   const kernel = kernels[strength - 1]!;
-  const copy = new Int32Array(size);
   for (let i = 0; i < size; i++) copy[i] = edge.get(i - 1);
   for (let i = 1; i < size; i++) {
     let sum = 0;
@@ -771,8 +925,9 @@ function filterIntraEdge(edge: DirectionalEdge, size: number, strength: number):
   }
 }
 
-function upsampleIntraEdge(edge: DirectionalEdge, sampleCount: number, maximum: number): void {
-  const duplicate = new Int32Array(sampleCount + 3);
+function upsampleIntraEdge(
+  edge: DirectionalEdge, sampleCount: number, maximum: number, duplicate: Int32Array,
+): void {
   duplicate[0] = edge.get(-1);
   for (let i = -1; i < sampleCount; i++) duplicate[i + 2] = edge.get(i);
   duplicate[sampleCount + 2] = edge.get(sampleCount - 1);
@@ -786,15 +941,18 @@ function upsampleIntraEdge(edge: DirectionalEdge, sampleCount: number, maximum: 
 }
 
 function round2(value: number, bits: number): number {
-  return bits ? Math.floor((value + 2 ** (bits - 1)) / 2 ** bits) : value;
+  // Intra-prediction intermediates are bounded well inside signed 32-bit
+  // range. Arithmetic shifts preserve the required floor semantics for both
+  // positive and negative values without floating-point exponentiation.
+  return bits ? (value + (1 << (bits - 1))) >> bits : value;
 }
 
 function floorShift(value: number, bits: number): number {
-  return bits ? Math.floor(value / 2 ** bits) : value;
+  return bits ? value >> bits : value;
 }
 
 function lowFiveBits(value: number): number {
-  return ((value % 32) + 32) % 32;
+  return value & 31;
 }
 
 function clip(value: number, minimum: number, maximum: number): number {

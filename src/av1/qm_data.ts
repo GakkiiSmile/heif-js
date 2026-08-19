@@ -9,6 +9,7 @@ for (let index = 0; index < TABLE_AREAS.length; index++) {
   total += TABLE_AREAS[index]! * 30;
 }
 let qmBytesCache: Uint8Array | null = null;
+let qmBase64Lookup: Uint8Array | null = null;
 
 function qmBytes(): Uint8Array {
   if (qmBytesCache) return qmBytesCache;
@@ -25,13 +26,14 @@ function qmBytes(): Uint8Array {
 // implements the exact Base64 subset needed here.
 function decodeQmBase64(text: string): Uint8Array {
   const bytes = new Uint8Array((text.length >>> 2) * 3);
+  const values = qmBase64Lookup ??= createQmBase64Lookup();
   let output = 0;
   for (let index = 0; index < text.length; index += 4) {
     const value =
-      base64Value(text.charCodeAt(index)) * 0x40000 +
-      base64Value(text.charCodeAt(index + 1)) * 0x1000 +
-      base64Value(text.charCodeAt(index + 2)) * 0x40 +
-      base64Value(text.charCodeAt(index + 3));
+      values[text.charCodeAt(index)]! * 0x40000 +
+      values[text.charCodeAt(index + 1)]! * 0x1000 +
+      values[text.charCodeAt(index + 2)]! * 0x40 +
+      values[text.charCodeAt(index + 3)]!;
     bytes[output++] = value >>> 16;
     bytes[output++] = value >>> 8;
     bytes[output++] = value;
@@ -39,11 +41,13 @@ function decodeQmBase64(text: string): Uint8Array {
   return bytes;
 }
 
-function base64Value(code: number): number {
-  if (code >= 65 && code <= 90) return code - 65;
-  if (code >= 97 && code <= 122) return code - 71;
-  if (code >= 48 && code <= 57) return code + 4;
-  return code === 43 ? 62 : 63;
+function createQmBase64Lookup(): Uint8Array {
+  const lookup = new Uint8Array(123);
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  for (let index = 0; index < alphabet.length; index++) {
+    lookup[alphabet.charCodeAt(index)] = index;
+  }
+  return lookup;
 }
 
 // dav1d stores transform coefficients transposed, hence rectangular W/H map inversely.

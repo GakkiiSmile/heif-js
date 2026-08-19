@@ -23,8 +23,12 @@ interface Result {
 const fixtures = [
   ['HEVC 8-bit', 'testimages/heic_a.heic', 320, 240],
   ['AV1 8-bit', 'testimages/avif_a_8.avif', 320, 240],
+  ['AV1 10-bit directional', 'testimages/avif_c_10.avif', 256, 256],
+  ['AV1 quant matrices', 'testimages/avif_qm.avif.b64', 512, 384],
   ['AV1 IntraBC + irot', 'testimages/avif_intrabc.avif.b64', 240, 320],
   ['AV1 multi-tile', 'testimages/avif_multitile_multigroup.avif.b64', 512, 384],
+  ['AV1 super-resolution', 'testimages/avif_superres.avif.b64', 512, 384],
+  ['AV1 film grain', 'testimages/avif_filmgrain.avif.b64', 512, 384],
   ['HEIF alpha + prem', 'testimages/heif_prem.heic.b64', 48, 40],
   ['AV1 restoration 3MP', 'testimages/avif_restoration.avif.b64', 2048, 1536],
 ] as const;

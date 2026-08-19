@@ -40,6 +40,29 @@ for (const [name, width, height] of heicCases) {
   console.log(`ok HEIC ${name}: ${width}x${height}, RGB PSNR ${psnr.toFixed(2)} dB`);
 }
 
+const outputReuseEncoded = new Uint8Array(readFileSync('testimages/heic_a.heic'));
+const outputReuseExpected = decodeToRgba(outputReuseEncoded);
+const reusableOutput = new Uint8ClampedArray(outputReuseExpected.data.length);
+const outputReuseDecoded = decodeToRgba(outputReuseEncoded, { output: reusableOutput });
+assert.equal(outputReuseDecoded.data, reusableOutput);
+assert.deepEqual(outputReuseDecoded.data, outputReuseExpected.data);
+assert.throws(
+  () => decodeToRgba(outputReuseEncoded, { output: new Uint8ClampedArray(reusableOutput.length - 1) }),
+  (error: unknown) => error instanceof DecodeError && error.code === 'INVALID_INPUT',
+);
+const overlappingStorage = new ArrayBuffer(reusableOutput.length);
+const overlappingInput = new Uint8Array(overlappingStorage, 0, outputReuseEncoded.length);
+overlappingInput.set(outputReuseEncoded);
+assert.throws(
+  () => decodeToRgba(overlappingInput, { output: new Uint8ClampedArray(overlappingStorage) }),
+  (error: unknown) => error instanceof DecodeError && error.code === 'INVALID_INPUT',
+);
+const asyncReusableOutput = new Uint8ClampedArray(reusableOutput.length);
+const asyncOutputReuseDecoded = await decodeToRgbaAsync(outputReuseEncoded, { output: asyncReusableOutput });
+assert.equal(asyncOutputReuseDecoded.data, asyncReusableOutput);
+assert.deepEqual(asyncOutputReuseDecoded.data, outputReuseExpected.data);
+console.log('ok caller-provided RGBA output buffer reuse + overlap/size validation');
+
 const zeroCopyBytes = new Uint8Array(readFileSync('testimages/heic_a.heic'));
 const zeroCopyFile = new HeifFile().parse(zeroCopyBytes);
 const zeroCopyData = zeroCopyFile.primary.data;
@@ -187,6 +210,10 @@ for (const [name, type, width, height, checksum] of [
   const decoded = decodeToRgba(encoded);
   assert.deepEqual([decoded.width, decoded.height], [width, height]);
   assert.equal(fnv1a(decoded.data), checksum);
+  const reused = new Uint8ClampedArray(decoded.data.length);
+  const decodedInto = decodeToRgba(encoded, { output: reused });
+  assert.equal(decodedInto.data, reused);
+  assert.deepEqual(decodedInto.data, decoded.data);
   if (name === 'grid') assert.equal(file.primary.references.dimg?.length, 6);
   if (name === 'prem') {
     let transparent = 0;
@@ -358,6 +385,10 @@ const intrabcEncoded = new Uint8Array(Buffer.from(
 const intrabcDecoded = decodeToRgba(intrabcEncoded);
 assert.equal(intrabcDecoded.width, 240);
 assert.equal(intrabcDecoded.height, 320);
+const intrabcOutput = new Uint8ClampedArray(intrabcDecoded.data.length);
+const intrabcDecodedInto = decodeToRgba(intrabcEncoded, { output: intrabcOutput });
+assert.equal(intrabcDecodedInto.data, intrabcOutput);
+assert.deepEqual(intrabcDecodedInto.data, intrabcDecoded.data);
 const intrabcReference = await decodePng(Buffer.from(
   readFileSync('testimages/gt_avif_intrabc.png.b64', 'utf8').replace(/\s/g, ''), 'base64',
 ));
@@ -392,6 +423,8 @@ console.log(`ok AVIF 2x2 tiles / 4 tile groups: 512x384, sampled RGB PSNR ${mult
 const superResEncoded = new Uint8Array(Buffer.from(
   readFileSync('testimages/avif_superres.avif.b64', 'utf8').replace(/\s/g, ''), 'base64',
 ));
+const superResFile = new HeifFile().parse(superResEncoded);
+assert.equal(fnv1aPlanes8(new Av1Decoder().decode(superResFile.primary.data).frame.planes), 95560061);
 const superResDecoded = decodeToRgba(superResEncoded);
 assert.equal(superResDecoded.width, 512);
 assert.equal(superResDecoded.height, 384);
@@ -414,6 +447,8 @@ for (const [layout, minimumPsnr] of [['422', 44], ['444', 46]] as const) {
 }
 
 const filmGrainEncoded = readBase64Fixture('testimages/avif_filmgrain.avif.b64');
+const filmGrainFile = new HeifFile().parse(filmGrainEncoded);
+assert.equal(fnv1aPlanes8(new Av1Decoder().decode(filmGrainFile.primary.data).frame.planes), 2940198444);
 const filmGrainDecoded = decodeToRgba(filmGrainEncoded);
 const filmGrainReference = readBase64Fixture('testimages/gt_avif_filmgrain.rgb.b64');
 const filmGrainPsnr = sampledRgbPsnr(filmGrainDecoded.data, 512, filmGrainReference, 32, 24, 16);
@@ -423,6 +458,7 @@ console.log(`ok AVIF film grain: 512x384, sampled RGB PSNR ${filmGrainPsnr.toFix
 const restorationEncoded = readBase64Fixture('testimages/avif_restoration.avif.b64');
 const restorationFile = new HeifFile().parse(restorationEncoded);
 const restorationSyntax = new Av1Decoder().decode(restorationFile.primary.data);
+assert.equal(fnv1aPlanes8(restorationSyntax.frame.planes), 2785726492);
 assert.equal(restorationSyntax.blocks.length, 1835);
 assert.equal(restorationSyntax.finalRange, 37051);
 assert.deepEqual(

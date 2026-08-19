@@ -81,8 +81,17 @@ const D50 = [0.34567, 0.35850] as const;
 const D50_TO_D65 = chromaticAdaptation(D50, D65);
 const NCLX_TO_SRGB = new Map<number, Mat3>();
 const ICC_TRANSFORMS = new WeakMap<Uint8Array, IccTransform | null>();
+const STANDARD_8_TABLES = new Map<string, Standard8Tables>();
 
 type IccTransform = (red: number, green: number, blue: number, output: MutableVec3) => void;
+
+interface Standard8Tables {
+  y: Float64Array;
+  red: Float64Array;
+  greenRed: Float64Array;
+  greenBlue: Float64Array;
+  blue: Float64Array;
+}
 
 export interface FrameCrop {
   left: number;
@@ -102,10 +111,11 @@ export function frameToRgba(
   iccProfile: Uint8Array | null = null,
   colorManagement = true,
   crop: FrameCrop | null = null,
+  output: Uint8ClampedArray | null = null,
 ): Uint8ClampedArray {
   return frameToPixels(
     frame, matrixCoefficients, fullRange, colourPrimaries, transferCharacteristics,
-    chromaSamplePosition, iccProfile, colorManagement, false, crop,
+    chromaSamplePosition, iccProfile, colorManagement, false, crop, output,
   );
 }
 
@@ -121,7 +131,7 @@ export function frameToAlpha(
 ): Uint8ClampedArray {
   return frameToPixels(
     frame, matrixCoefficients, fullRange, colourPrimaries, transferCharacteristics,
-    chromaSamplePosition, null, false, true, crop,
+    chromaSamplePosition, null, false, true, crop, null,
   );
 }
 
@@ -136,12 +146,17 @@ function frameToPixels(
   colorManagement: boolean,
   alphaOnly: boolean,
   crop: FrameCrop | null,
+  output: Uint8ClampedArray | null,
 ): Uint8ClampedArray {
   const { bitDepth, chromaBitDepth, chromaFormat } = frame;
   const left = crop?.left ?? 0, top = crop?.top ?? 0;
   const width = crop?.width ?? frame.width, height = crop?.height ?? frame.height;
   const channels = alphaOnly ? 1 : 4;
-  const out = new Uint8ClampedArray(width * height * channels);
+  const outputLength = width * height * channels;
+  if (output && output.length !== outputLength) {
+    throw new RangeError(`RGBA output length ${output.length} does not match required length ${outputLength}`);
+  }
+  const out = output ?? new Uint8ClampedArray(outputLength);
   const maxValue = (1 << bitDepth) - 1;
   const rangeScale = 1 << Math.max(0, bitDepth - 8);
   const yOffset = fullRange ? 0 : 16 * rangeScale;
@@ -193,7 +208,7 @@ function frameToPixels(
       matrixCoefficients !== 15) {
     writeStandard8(
       out, frame, left, top, width, height, alphaOnly, fullRange, coefficients,
-      horizontalShift, verticalShift, chromaSamplePosition,
+      horizontalShift, verticalShift, chromaSamplePosition, matrixCoefficients,
     );
     return out;
   }
@@ -254,6 +269,7 @@ function writeStandard8(
   left: number, top: number, width: number, height: number, alphaOnly: boolean,
   fullRange: boolean, coefficients: readonly [number, number],
   horizontalShift: number, verticalShift: number, chromaSamplePosition: number,
+  matrixCoefficients: number,
 ): void {
   const luma = frame.luma, cb = frame.cb, cr = frame.cr;
   const yOffset = fullRange ? 0 : 16, yRange = fullRange ? 255 : 219;
@@ -263,6 +279,20 @@ function writeStandard8(
   const greenRedScale = 2 * kr * (1 - kr) / kg;
   const greenBlueScale = 2 * kb * (1 - kb) / kg;
   const direct = (!horizontalShift && !verticalShift) || chromaSamplePosition === 0;
+  const tables = standard8Tables(
+    matrixCoefficients, fullRange, yOffset, yRange, chromaRange,
+    redScale, blueScale, greenRedScale, greenBlueScale,
+  );
+  if (direct) {
+    if (horizontalShift === 1 && verticalShift === 1 && !(left & 1) && !(top & 1)) {
+      writeDirect420Standard8(out, frame, left, top, width, height, alphaOnly, tables);
+    } else {
+      writeDirectStandard8(
+        out, frame, left, top, width, height, alphaOnly, horizontalShift, verticalShift, tables,
+      );
+    }
+    return;
+  }
   const x0s = direct ? null : new Uint32Array(width);
   const x1s = direct ? null : new Uint32Array(width);
   const fractionsX = direct ? null : new Float64Array(width);
@@ -311,7 +341,7 @@ function writeStandard8(
         cbCode = cbTop * inverseY + cbBottom * fractionY;
         crCode = crTop * inverseY + crBottom * fractionY;
       }
-      const yPrime = (luma.data[lumaRow + x]! - yOffset) / yRange;
+      const yPrime = tables.y[luma.data[lumaRow + x]!]!;
       const pb = (cbCode - 128) / chromaRange;
       const pr = (crCode - 128) / chromaRange;
       out[offset++] = (yPrime + redScale * pr) * 255;
@@ -321,6 +351,122 @@ function writeStandard8(
         out[offset++] = 255;
       }
     }
+  }
+}
+
+function standard8Tables(
+  matrix: number, fullRange: boolean, yOffset: number, yRange: number, chromaRange: number,
+  redScale: number, blueScale: number, greenRedScale: number, greenBlueScale: number,
+): Standard8Tables {
+  // Matrix 12 derives Kr/Kb from colour primaries, so the numeric matrix code
+  // alone is not a sufficient cache key.
+  const key = `${matrix}:${+fullRange}:${redScale}:${blueScale}`;
+  let tables = STANDARD_8_TABLES.get(key);
+  if (tables) return tables;
+  tables = {
+    y: new Float64Array(256),
+    red: new Float64Array(256),
+    greenRed: new Float64Array(256),
+    greenBlue: new Float64Array(256),
+    blue: new Float64Array(256),
+  };
+  for (let code = 0; code < 256; code++) {
+    tables.y[code] = (code - yOffset) / yRange;
+    const chroma = (code - 128) / chromaRange;
+    tables.red[code] = redScale * chroma;
+    tables.greenRed[code] = greenRedScale * chroma;
+    tables.greenBlue[code] = greenBlueScale * chroma;
+    tables.blue[code] = blueScale * chroma;
+  }
+  STANDARD_8_TABLES.set(key, tables);
+  return tables;
+}
+
+function writeDirectStandard8(
+  out: Uint8ClampedArray, frame: DecodedFrame,
+  left: number, top: number, width: number, height: number, alphaOnly: boolean,
+  horizontalShift: number, verticalShift: number, tables: Standard8Tables,
+): void {
+  const luma = frame.luma, cb = frame.cb, cr = frame.cr;
+  const yTable = tables.y, red = tables.red, greenRed = tables.greenRed;
+  const greenBlue = tables.greenBlue, blue = tables.blue;
+  let output = 0;
+  for (let y = 0; y < height; y++) {
+    const sourceY = top + y;
+    const lumaRow = sourceY * luma.stride + left;
+    const chromaRow = (sourceY >> verticalShift) * cb.stride;
+    for (let x = 0; x < width; x++) {
+      const sourceX = left + x;
+      const chromaIndex = chromaRow + (sourceX >> horizontalShift);
+      const crCode = cr.data[chromaIndex]!;
+      const yPrime = yTable[luma.data[lumaRow + x]!]!;
+      out[output++] = (yPrime + red[crCode]!) * 255;
+      if (!alphaOnly) {
+        const cbCode = cb.data[chromaIndex]!;
+        out[output++] = (yPrime - greenRed[crCode]! - greenBlue[cbCode]!) * 255;
+        out[output++] = (yPrime + blue[cbCode]!) * 255;
+        out[output++] = 255;
+      }
+    }
+  }
+}
+
+function writeDirect420Standard8(
+  out: Uint8ClampedArray, frame: DecodedFrame,
+  left: number, top: number, width: number, height: number, alphaOnly: boolean,
+  tables: Standard8Tables,
+): void {
+  const luma = frame.luma, cb = frame.cb, cr = frame.cr;
+  const yTable = tables.y, red = tables.red, greenRed = tables.greenRed;
+  const greenBlue = tables.greenBlue, blue = tables.blue;
+  const channels = alphaOnly ? 1 : 4;
+  for (let y = 0; y < height; y += 2) {
+    const sourceY = top + y;
+    const lumaRow0 = sourceY * luma.stride + left;
+    const lumaRow1 = Math.min(sourceY + 1, top + height - 1) * luma.stride + left;
+    const chromaRow = (sourceY >> 1) * cb.stride + (left >> 1);
+    const outputRow0 = y * width * channels;
+    const outputRow1 = Math.min(y + 1, height - 1) * width * channels;
+    for (let x = 0; x < width; x += 2) {
+      const chromaIndex = chromaRow + (x >> 1);
+      const cbCode = cb.data[chromaIndex]!, crCode = cr.data[chromaIndex]!;
+      const redTerm = red[crCode]!, greenRedTerm = greenRed[crCode]!;
+      const greenBlueTerm = greenBlue[cbCode]!, blueTerm = blue[cbCode]!;
+      writeDirectPixel(
+        out, outputRow0 + x * channels, yTable[luma.data[lumaRow0 + x]!]!,
+        redTerm, greenRedTerm, greenBlueTerm, blueTerm, alphaOnly,
+      );
+      if (x + 1 < width) {
+        writeDirectPixel(
+          out, outputRow0 + (x + 1) * channels, yTable[luma.data[lumaRow0 + x + 1]!]!,
+          redTerm, greenRedTerm, greenBlueTerm, blueTerm, alphaOnly,
+        );
+      }
+      if (y + 1 < height) {
+        writeDirectPixel(
+          out, outputRow1 + x * channels, yTable[luma.data[lumaRow1 + x]!]!,
+          redTerm, greenRedTerm, greenBlueTerm, blueTerm, alphaOnly,
+        );
+        if (x + 1 < width) {
+          writeDirectPixel(
+            out, outputRow1 + (x + 1) * channels, yTable[luma.data[lumaRow1 + x + 1]!]!,
+            redTerm, greenRedTerm, greenBlueTerm, blueTerm, alphaOnly,
+          );
+        }
+      }
+    }
+  }
+}
+
+function writeDirectPixel(
+  out: Uint8ClampedArray, offset: number, yPrime: number,
+  red: number, greenRed: number, greenBlue: number, blue: number, alphaOnly: boolean,
+): void {
+  out[offset] = (yPrime + red) * 255;
+  if (!alphaOnly) {
+    out[offset + 1] = (yPrime - greenRed - greenBlue) * 255;
+    out[offset + 2] = (yPrime + blue) * 255;
+    out[offset + 3] = 255;
   }
 }
 

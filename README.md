@@ -20,6 +20,15 @@ const { width, height, data } = decodeToRgba(binary);
 // data 是 width × height × 4 的 Uint8ClampedArray（straight-alpha sRGB RGBA8）。
 ```
 
+批量解码相同尺寸图片时，可以复用调用方分配的 RGBA 缓冲区，避免每帧重新分配
+输出数组。缓冲区长度必须精确等于 `width * height * 4`，且不能与编码输入重叠：
+
+```ts
+const output = new Uint8ClampedArray(width * height * 4);
+const image = decodeToRgba(binary, { output });
+// image.data === output
+```
+
 也可以使用 `decodeToImageData(binary)`。`decodeToRgba` 是同步函数；默认导出的
 `decode` 调用浏览器 `createImageBitmap()`，因此返回 `Promise<ImageBitmap>`。
 

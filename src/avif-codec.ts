@@ -6,7 +6,7 @@ import { Av1Decoder } from './av1/decode.ts';
 import { OBU_SEQUENCE_HEADER, parseObus, parseSequenceHeader } from './av1/obu.ts';
 
 export const decodeAv1Item: ItemCodecDecoder = (
-  item, limits, colorManagement,
+  item, limits, colorManagement, output,
 ): DecodedItemImage => {
   const decoded = new Av1Decoder(limits).decode(item.data);
   validateAv1Configuration(item, decoded.sequence);
@@ -20,7 +20,7 @@ export const decodeAv1Item: ItemCodecDecoder = (
     data: colorManagement
       ? frameToRgba(
         decoded.frame, matrix, fullRange, primaries, transfer, decoded.sequence.chromaSamplePosition,
-        item.icc, true,
+        item.icc, true, null, output ?? null,
       )
       : frameToAlpha(
         decoded.frame, matrix, fullRange, primaries, transfer, decoded.sequence.chromaSamplePosition,

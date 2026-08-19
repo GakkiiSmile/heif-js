@@ -6,7 +6,7 @@ import { HevcDecoder } from './hevc/decode.ts';
 import { nalsFromLengthPrefixed, parseHvcC } from './hevc/nal.ts';
 
 export const decodeHevcItem: ItemCodecDecoder = (
-  item, limits, colorManagement,
+  item, limits, colorManagement, output,
 ): DecodedItemImage => {
   if (!item.config) throw new DecodeError('MISSING_CONFIG', 'HEVC image item has no hvcC configuration');
   const config = parseHvcC(item.config);
@@ -43,7 +43,7 @@ export const decodeHevcItem: ItemCodecDecoder = (
   return {
     width, height,
     data: colorManagement
-      ? frameToRgba(frame, matrix, fullRange, primaries, transfer, chromaLocation, item.icc, true, crop)
+      ? frameToRgba(frame, matrix, fullRange, primaries, transfer, chromaLocation, item.icc, true, crop, output ?? null)
       : frameToAlpha(frame, matrix, fullRange, primaries, transfer, chromaLocation, crop),
     channels: colorManagement ? 4 : 1,
   };

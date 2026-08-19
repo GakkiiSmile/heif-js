@@ -33,7 +33,7 @@ function createDirectionScratch(): DirectionScratch {
 /** Apply AV1's constrained directional enhancement filter to a reconstructed frame. */
 export function applyCdef(
   frame: DecodedFrame, blocks: readonly Av1DecodedBlock[],
-  sequence: Av1SequenceHeader, header: Av1FrameHeader,
+  sequence: Av1SequenceHeader, header: Av1FrameHeader, sourceFrame: DecodedFrame | null = null,
 ): void {
   if (!header.cdefYStrength.length ||
       !header.cdefYStrength.some(Boolean) && !header.cdefUvStrength.some(Boolean)) return;
@@ -57,8 +57,11 @@ export function applyCdef(
 
   const filterLuma = header.cdefYStrength.some(Boolean);
   const filterChroma = header.cdefUvStrength.some(Boolean);
-  const sources = frame.planes.map((plane, index) =>
-    (index === 0 ? filterLuma : filterChroma) ? copyPlane(plane) : plane);
+  // Restoration already keeps an immutable pre-CDEF/deblocked frame. Reuse it
+  // instead of copying every active plane a second time.
+  const sources = sourceFrame && sourceFrame !== frame ? sourceFrame.planes :
+    frame.planes.map((plane, index) =>
+      (index === 0 ? filterLuma : filterChroma) ? copyPlane(plane) : plane);
   const directionScratch = createDirectionScratch();
   const bitDepthShift = sequence.bitDepth - 8;
   const damping = header.cdefDamping + bitDepthShift;
@@ -249,7 +252,21 @@ function filterInteriorBlock(
   const secondaryOffset01 = secondary1[0]![1] * sourceStride + secondary1[0]![0];
   const secondaryOffset10 = secondary0[1]![1] * sourceStride + secondary0[1]![0];
   const secondaryOffset11 = secondary1[1]![1] * sourceStride + secondary1[1]![0];
-  const clampOutput = !!primaryStrength && !!secondaryStrength;
+  if (!secondaryStrength) {
+    filterInteriorPrimary(
+      sourceData, destinationData, sourceStride, destinationStride, x0, y0, width, height,
+      primaryStrength, primaryShift, primaryTap0, primaryTap1, primaryOffset0, primaryOffset1,
+    );
+    return;
+  }
+  if (!primaryStrength) {
+    filterInteriorSecondary(
+      sourceData, destinationData, sourceStride, destinationStride, x0, y0, width, height,
+      secondaryStrength, secondaryShift,
+      secondaryOffset00, secondaryOffset01, secondaryOffset10, secondaryOffset11,
+    );
+    return;
+  }
 
   for (let y = 0; y < height; y++) {
     let sourceIndex = (y0 + y) * sourceStride + x0;
@@ -258,53 +275,94 @@ function filterInteriorBlock(
       const center = sourceData[sourceIndex]!;
       let sum = 0, minimum = center, maximum = center;
       let negative: number, positive: number;
-      if (primaryStrength) {
-        negative = sourceData[sourceIndex - primaryOffset0]!;
-        positive = sourceData[sourceIndex + primaryOffset0]!;
-        sum += primaryTap0 * constrain(negative - center, primaryStrength, primaryShift);
-        sum += primaryTap0 * constrain(positive - center, primaryStrength, primaryShift);
-        minimum = Math.min(minimum, negative, positive);
-        maximum = Math.max(maximum, negative, positive);
+      negative = sourceData[sourceIndex - primaryOffset0]!;
+      positive = sourceData[sourceIndex + primaryOffset0]!;
+      sum += primaryTap0 * constrain(negative - center, primaryStrength, primaryShift);
+      sum += primaryTap0 * constrain(positive - center, primaryStrength, primaryShift);
+      minimum = Math.min(minimum, negative, positive);
+      maximum = Math.max(maximum, negative, positive);
 
-        negative = sourceData[sourceIndex - primaryOffset1]!;
-        positive = sourceData[sourceIndex + primaryOffset1]!;
-        sum += primaryTap1 * constrain(negative - center, primaryStrength, primaryShift);
-        sum += primaryTap1 * constrain(positive - center, primaryStrength, primaryShift);
-        minimum = Math.min(minimum, negative, positive);
-        maximum = Math.max(maximum, negative, positive);
-      }
-      if (secondaryStrength) {
-        negative = sourceData[sourceIndex - secondaryOffset00]!;
-        positive = sourceData[sourceIndex + secondaryOffset00]!;
-        sum += 2 * constrain(negative - center, secondaryStrength, secondaryShift);
-        sum += 2 * constrain(positive - center, secondaryStrength, secondaryShift);
-        minimum = Math.min(minimum, negative, positive);
-        maximum = Math.max(maximum, negative, positive);
+      negative = sourceData[sourceIndex - primaryOffset1]!;
+      positive = sourceData[sourceIndex + primaryOffset1]!;
+      sum += primaryTap1 * constrain(negative - center, primaryStrength, primaryShift);
+      sum += primaryTap1 * constrain(positive - center, primaryStrength, primaryShift);
+      minimum = Math.min(minimum, negative, positive);
+      maximum = Math.max(maximum, negative, positive);
 
-        negative = sourceData[sourceIndex - secondaryOffset01]!;
-        positive = sourceData[sourceIndex + secondaryOffset01]!;
-        sum += 2 * constrain(negative - center, secondaryStrength, secondaryShift);
-        sum += 2 * constrain(positive - center, secondaryStrength, secondaryShift);
-        minimum = Math.min(minimum, negative, positive);
-        maximum = Math.max(maximum, negative, positive);
+      negative = sourceData[sourceIndex - secondaryOffset00]!;
+      positive = sourceData[sourceIndex + secondaryOffset00]!;
+      sum += 2 * constrain(negative - center, secondaryStrength, secondaryShift);
+      sum += 2 * constrain(positive - center, secondaryStrength, secondaryShift);
+      minimum = Math.min(minimum, negative, positive);
+      maximum = Math.max(maximum, negative, positive);
 
-        negative = sourceData[sourceIndex - secondaryOffset10]!;
-        positive = sourceData[sourceIndex + secondaryOffset10]!;
-        sum += constrain(negative - center, secondaryStrength, secondaryShift);
-        sum += constrain(positive - center, secondaryStrength, secondaryShift);
-        minimum = Math.min(minimum, negative, positive);
-        maximum = Math.max(maximum, negative, positive);
+      negative = sourceData[sourceIndex - secondaryOffset01]!;
+      positive = sourceData[sourceIndex + secondaryOffset01]!;
+      sum += 2 * constrain(negative - center, secondaryStrength, secondaryShift);
+      sum += 2 * constrain(positive - center, secondaryStrength, secondaryShift);
+      minimum = Math.min(minimum, negative, positive);
+      maximum = Math.max(maximum, negative, positive);
 
-        negative = sourceData[sourceIndex - secondaryOffset11]!;
-        positive = sourceData[sourceIndex + secondaryOffset11]!;
-        sum += constrain(negative - center, secondaryStrength, secondaryShift);
-        sum += constrain(positive - center, secondaryStrength, secondaryShift);
-        minimum = Math.min(minimum, negative, positive);
-        maximum = Math.max(maximum, negative, positive);
-      }
+      negative = sourceData[sourceIndex - secondaryOffset10]!;
+      positive = sourceData[sourceIndex + secondaryOffset10]!;
+      sum += constrain(negative - center, secondaryStrength, secondaryShift);
+      sum += constrain(positive - center, secondaryStrength, secondaryShift);
+      minimum = Math.min(minimum, negative, positive);
+      maximum = Math.max(maximum, negative, positive);
+
+      negative = sourceData[sourceIndex - secondaryOffset11]!;
+      positive = sourceData[sourceIndex + secondaryOffset11]!;
+      sum += constrain(negative - center, secondaryStrength, secondaryShift);
+      sum += constrain(positive - center, secondaryStrength, secondaryShift);
+      minimum = Math.min(minimum, negative, positive);
+      maximum = Math.max(maximum, negative, positive);
       let value = center + ((sum - +(sum < 0) + 8) >> 4);
-      if (clampOutput) value = Math.max(minimum, Math.min(maximum, value));
+      value = Math.max(minimum, Math.min(maximum, value));
       destinationData[destinationIndex] = value;
+    }
+  }
+}
+
+function filterInteriorPrimary(
+  source: Plane['data'], destination: Plane['data'], sourceStride: number, destinationStride: number,
+  x0: number, y0: number, width: number, height: number,
+  strength: number, shift: number, tap0: number, tap1: number, offset0: number, offset1: number,
+): void {
+  for (let y = 0; y < height; y++) {
+    let sourceIndex = (y0 + y) * sourceStride + x0;
+    let destinationIndex = (y0 + y) * destinationStride + x0;
+    for (let x = 0; x < width; x++, sourceIndex++, destinationIndex++) {
+      const center = source[sourceIndex]!;
+      let sum = 0;
+      sum += tap0 * constrain(source[sourceIndex - offset0]! - center, strength, shift);
+      sum += tap0 * constrain(source[sourceIndex + offset0]! - center, strength, shift);
+      sum += tap1 * constrain(source[sourceIndex - offset1]! - center, strength, shift);
+      sum += tap1 * constrain(source[sourceIndex + offset1]! - center, strength, shift);
+      destination[destinationIndex] = center + ((sum - +(sum < 0) + 8) >> 4);
+    }
+  }
+}
+
+function filterInteriorSecondary(
+  source: Plane['data'], destination: Plane['data'], sourceStride: number, destinationStride: number,
+  x0: number, y0: number, width: number, height: number, strength: number, shift: number,
+  offset00: number, offset01: number, offset10: number, offset11: number,
+): void {
+  for (let y = 0; y < height; y++) {
+    let sourceIndex = (y0 + y) * sourceStride + x0;
+    let destinationIndex = (y0 + y) * destinationStride + x0;
+    for (let x = 0; x < width; x++, sourceIndex++, destinationIndex++) {
+      const center = source[sourceIndex]!;
+      let sum = 0;
+      sum += 2 * constrain(source[sourceIndex - offset00]! - center, strength, shift);
+      sum += 2 * constrain(source[sourceIndex + offset00]! - center, strength, shift);
+      sum += 2 * constrain(source[sourceIndex - offset01]! - center, strength, shift);
+      sum += 2 * constrain(source[sourceIndex + offset01]! - center, strength, shift);
+      sum += constrain(source[sourceIndex - offset10]! - center, strength, shift);
+      sum += constrain(source[sourceIndex + offset10]! - center, strength, shift);
+      sum += constrain(source[sourceIndex - offset11]! - center, strength, shift);
+      sum += constrain(source[sourceIndex + offset11]! - center, strength, shift);
+      destination[destinationIndex] = center + ((sum - +(sum < 0) + 8) >> 4);
     }
   }
 }

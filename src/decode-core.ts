@@ -44,6 +44,7 @@ export class DecodeError extends Error {
 
 export type ItemCodecDecoder = (
   item: ImageItem, limits: ResolvedDecodeLimits, colorManagement: boolean,
+  output?: Uint8ClampedArray,
 ) => DecodedItemImage;
 
 export interface CodecDecoders {
@@ -86,6 +87,13 @@ function decodeToRgbaWithCodecs(
   input: BinaryInput, options: DecodeOptions, codecs: Readonly<CodecDecoders>,
 ): DecodedImage {
   const bytes = asUint8Array(input);
+  const output = options.output;
+  if (output !== undefined && !(output instanceof Uint8ClampedArray)) {
+    throw new DecodeError('INVALID_INPUT', 'output must be a Uint8ClampedArray');
+  }
+  if (output && viewsOverlap(bytes, output)) {
+    throw new DecodeError('INVALID_INPUT', 'output must not overlap the encoded input');
+  }
   if (bytes.byteLength < 12) throw new DecodeError('INVALID_INPUT', 'Image input is too short');
   const format = detectFormat(bytes);
   if (format === 'unknown') throw new DecodeError('UNSUPPORTED_FORMAT', 'Input is not a supported HEIC, HEIF, or AVIF file');
@@ -102,7 +110,7 @@ function decodeToRgbaWithCodecs(
     const context: ItemDecodeContext = {
       active: new Set(), cache: new Map(), cacheable: findCacheableItems(file), codecs, limits, decodedPixels: 0,
     };
-    const image = decodeItem(file, file.primary, context, true);
+    const image = decodeItem(file, file.primary, context, true, output);
     if (image.channels !== 4) throw new DecodeError('DECODE_FAILED', 'Primary image did not decode to RGBA');
     // Keep the public object shape stable; `channels` is internal cache metadata.
     return { width: image.width, height: image.height, data: image.data };
@@ -126,6 +134,7 @@ interface ItemDecodeContext {
 
 function decodeItem(
   file: HeifFile, item: ImageItem, context: ItemDecodeContext, includeAlpha: boolean,
+  output?: Uint8ClampedArray,
 ): DecodedItemImage {
   const cacheKey = `${item.itemId}:${+includeAlpha}`;
   if (context.cacheable.has(item.itemId)) {
@@ -155,20 +164,24 @@ function decodeItem(
   let image: DecodedItemImage;
   let mutable = item.type !== 'iden';
   try {
+    const directOutput = output && includeAlpha && item.transformations.length === 0 ? output : undefined;
+    const codecOutput = directOutput &&
+      item.width > 0 && item.height > 0 && item.width * item.height * 4 === directOutput.length
+      ? directOutput : undefined;
     if (item.type === 'hvc1' || item.type === 'hev1') {
       if (!context.codecs.hevc) {
         throw new DecodeError('UNSUPPORTED_CODEC', 'HEVC image item requires the HEIC/HEVC decoder entry');
       }
-      image = context.codecs.hevc(item, context.limits, includeAlpha);
+      image = context.codecs.hevc(item, context.limits, includeAlpha, codecOutput);
     } else if (item.type === 'av01') {
       if (!context.codecs.av1) {
         throw new DecodeError('UNSUPPORTED_CODEC', 'AV1 image item requires the AVIF/AV1 decoder entry');
       }
-      image = context.codecs.av1(item, context.limits, includeAlpha);
+      image = context.codecs.av1(item, context.limits, includeAlpha, codecOutput);
     }
-    else if (item.type === 'grid') image = decodeGridItem(file, item, context, includeAlpha);
-    else if (item.type === 'iden') image = decodeIdentityItem(file, item, context, includeAlpha);
-    else if (item.type === 'iovl') image = decodeOverlayItem(file, item, context, includeAlpha);
+    else if (item.type === 'grid') image = decodeGridItem(file, item, context, includeAlpha, directOutput);
+    else if (item.type === 'iden') image = decodeIdentityItem(file, item, context, includeAlpha, directOutput);
+    else if (item.type === 'iovl') image = decodeOverlayItem(file, item, context, includeAlpha, directOutput);
     else throw new DecodeError('UNSUPPORTED_CODEC', `Unsupported HEIF item codec: ${item.type}`);
     if ((item.width && image.width !== item.width) || (item.height && image.height !== item.height)) {
       throw new DecodeError(
@@ -192,11 +205,29 @@ function decodeItem(
         mutable = unpremultiplied.mutable;
       }
     }
+    if (output && image.data !== output) {
+      if (output.length !== image.data.length) {
+        throw new DecodeError(
+          'INVALID_INPUT',
+          `output length ${output.length} does not match required length ${image.data.length}`,
+        );
+      }
+      output.set(image.data);
+      image = { width: image.width, height: image.height, data: output, channels: image.channels };
+      mutable = true;
+    }
     if (context.cacheable.has(item.itemId)) context.cache.set(cacheKey, image);
     return image;
   } finally {
     context.active.delete(item.itemId);
   }
+}
+
+function viewsOverlap(input: Uint8Array, output: Uint8ClampedArray): boolean {
+  if (input.buffer !== output.buffer) return false;
+  const inputEnd = input.byteOffset + input.byteLength;
+  const outputEnd = output.byteOffset + output.byteLength;
+  return input.byteOffset < outputEnd && output.byteOffset < inputEnd;
 }
 
 function findCacheableItems(file: HeifFile): Set<number> {
@@ -212,6 +243,7 @@ function findCacheableItems(file: HeifFile): Set<number> {
 
 function decodeGridItem(
   file: HeifFile, item: ImageItem, context: ItemDecodeContext, includeAlpha: boolean,
+  output?: Uint8ClampedArray,
 ): DecodedItemImage {
   const rows = item.gridRows, columns = item.gridCols;
   const ids = item.gridTiles ?? [];
@@ -231,7 +263,8 @@ function decodeGridItem(
   const channels = first.channels;
   validateImageDimensions(width, height, context.limits, 'HEIF grid');
   ensurePixelBudget(width * height, context, 'HEIF grid');
-  const data = new Uint8ClampedArray(width * height * channels);
+  const outputLength = width * height * channels;
+  const data = output?.length === outputLength ? output : new Uint8ClampedArray(outputLength);
 
   const copyTile = (tile: DecodedItemImage, row: number, column: number): void => {
     if (tile.width !== tileWidth || tile.height !== tileHeight || tile.channels !== channels) {
@@ -261,6 +294,7 @@ function decodeGridItem(
 
 function decodeIdentityItem(
   file: HeifFile, item: ImageItem, context: ItemDecodeContext, includeAlpha: boolean,
+  output?: Uint8ClampedArray,
 ): DecodedItemImage {
   const ids = item.references.dimg ?? [];
   if (ids.length !== 1) {
@@ -268,11 +302,12 @@ function decodeIdentityItem(
   }
   const source = file.items.get(ids[0]!);
   if (!source) throw new DecodeError('DECODE_FAILED', `HEIF identity source ${ids[0]} is missing`);
-  return decodeItem(file, source, context, includeAlpha);
+  return decodeItem(file, source, context, includeAlpha, output);
 }
 
 function decodeOverlayItem(
   file: HeifFile, item: ImageItem, context: ItemDecodeContext, includeAlpha: boolean,
+  output?: Uint8ClampedArray,
 ): DecodedItemImage {
   const ids = item.references.dimg ?? [];
   if (ids.length === 0) throw new DecodeError('DECODE_FAILED', 'HEIF overlay has no dimg references');
@@ -310,7 +345,8 @@ function decodeOverlayItem(
   // libheif's iovl output is an opaque RGB canvas. The fourth background
   // component is retained by the file format but does not create an alpha plane.
   const channels = includeAlpha ? 4 : 1;
-  const data = new Uint8ClampedArray(width * height * channels);
+  const outputLength = width * height * channels;
+  const data = output?.length === outputLength ? output : new Uint8ClampedArray(outputLength);
   if (channels === 1) {
     data.fill(background[0]!);
   } else {

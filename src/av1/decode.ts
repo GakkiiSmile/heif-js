@@ -67,6 +67,7 @@ export interface Av1RestorationUnit {
 }
 
 const EMPTY_RECONSTRUCTION_PAYLOAD = new Int32Array(0);
+const EMPTY_INTRABC_VALID = new Uint8Array(0);
 
 export class Av1Decoder {
   private readonly limits: ResolvedDecodeLimits;
@@ -126,15 +127,18 @@ export class Av1Decoder {
       const tileBlocks = tile.decode();
       reconstructAv1Frame(frame.planes, tileBlocks, sequence, header, bounds);
       releaseReconstructionPayloads(tileBlocks);
-      blocks.push(...tileBlocks);
-      restorationUnits.push(...tile.restorationUnits);
+      // Avoid turning every decoded block into a function argument. Large
+      // still images can contain far more blocks than an engine's argument
+      // count limit, and the explicit loops are cheaper as well.
+      for (const block of tileBlocks) blocks.push(block);
+      for (const unit of tile.restorationUnits) restorationUnits.push(unit);
       finalRange = tile.msac.range;
     }
     if (!debugEnabled('AV1_DISABLE_DEBLOCK')) applyDeblock(frame, blocks, sequence, header);
     const restorationEnabled = !debugEnabled('AV1_DISABLE_RESTORATION');
     const hasRestoration = restorationEnabled && restorationUnits.some(unit => unit.type);
     const deblockedFrame = hasRestoration ? cloneFrame(frame) : null;
-    if (!debugEnabled('AV1_DISABLE_CDEF')) applyCdef(frame, blocks, sequence, header);
+    if (!debugEnabled('AV1_DISABLE_CDEF')) applyCdef(frame, blocks, sequence, header, deblockedFrame);
     const outputFrame = debugEnabled('AV1_DISABLE_SUPERRES') ? frame :
       upscaleAv1Frame(frame, header.upscaledWidth, header.width);
     if (restorationEnabled) {
@@ -286,9 +290,11 @@ class TileDecoder {
     this.abovePalSizeUv = new Uint8Array(this.width4);
     this.abovePalUv = Array.from({ length: this.width4 }, () => [[], []]);
     const mapSize = this.mapWidth4 * (bounds.endY - bounds.startY);
-    this.intrabcMvValid = new Uint8Array(mapSize);
-    this.intrabcMvX = new Int32Array(mapSize);
-    this.intrabcMvY = new Int32Array(mapSize);
+    // IntraBC is forbidden for the vast majority of still images. Its two
+    // full tile-local motion-vector maps are otherwise pure wasted memory.
+    this.intrabcMvValid = header.allowIntrabc ? new Uint8Array(mapSize) : EMPTY_INTRABC_VALID;
+    this.intrabcMvX = header.allowIntrabc ? new Int32Array(mapSize) : EMPTY_RECONSTRUCTION_PAYLOAD;
+    this.intrabcMvY = header.allowIntrabc ? new Int32Array(mapSize) : EMPTY_RECONSTRUCTION_PAYLOAD;
     this.blockSizeMap = new Uint8Array(mapSize);
     this.lumaTxType = new Int8Array(mapSize);
     this.segmentMap = new Uint8Array(mapSize);
@@ -1209,7 +1215,7 @@ class TileDecoder {
         const index = this.mapIndex(bx + x, by + y);
         this.blockSizeMap[index] = block.blockSize;
         this.segmentMap[index] = block.segmentId;
-        this.intrabcMvValid[index] = +intrabc;
+        if (this.header.allowIntrabc) this.intrabcMvValid[index] = +intrabc;
         if (intrabc) {
           this.intrabcMvX[index] = block.mvX;
           this.intrabcMvY[index] = block.mvY;

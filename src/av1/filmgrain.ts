@@ -23,10 +23,11 @@ export function applyFilmGrain(
     data.uvPoints[1].length > 0 || data.chromaScalingFromLuma,
   ] : [false, false];
   if (!activeY && !activeChroma[0] && !activeChroma[1]) return;
-  const source = frame.planes.map((plane, index) => {
-    if (index === 0) return activeY ? plane.data.slice() : plane.data;
-    return activeChroma[index - 1] ? plane.data.slice() : null;
-  });
+  // Grain application reads each chroma sample before replacing that same
+  // sample, so chroma planes do not need snapshots. Preserve luma only when a
+  // subsequently processed chroma plane needs the pre-grain luma values.
+  const source = frame.planes.map(plane => plane.data);
+  if (activeY && (activeChroma[0] || activeChroma[1])) source[0] = frame.luma.data.slice();
   const yScalingNeeded = activeY || data.chromaScalingFromLuma && (activeChroma[0] || activeChroma[1]);
   const yScaling = yScalingNeeded ?
     generateScaling(sequence.bitDepth, data.yPoints, FILM_GRAIN_SCRATCH.yScaling) : null;
@@ -120,7 +121,7 @@ function generateChromaGrain(
 }
 
 function applyPlaneGrain(
-  frame: DecodedFrame, source: (SampleArray | null)[], planeIndex: number,
+  frame: DecodedFrame, source: SampleArray[], planeIndex: number,
   grain: Int16Array, scaling: Uint8Array, data: Av1FilmGrain,
   sequence: Av1SequenceHeader, subX: number, subY: number,
 ): void {
@@ -144,6 +145,13 @@ function applyPlaneGrain(
   let currentOffsets = FILM_GRAIN_SCRATCH.currentOffsets;
   let previousOffsets = FILM_GRAIN_SCRATCH.previousOffsets;
   const grainStepX = 2 >> subX, grainStepY = 2 >> subY;
+  const chroma = planeIndex !== 0;
+  const uv = planeIndex - 1;
+  const chromaFromLuma = data.chromaScalingFromLuma;
+  const uvLumaMult = chroma ? data.uvLumaMult[uv]! : 0;
+  const uvMult = chroma ? data.uvMult[uv]! : 0;
+  const uvOffset = chroma ? data.uvOffset[uv]! << bitDepthShift : 0;
+  const maxScalingIndex = (1 << sequence.bitDepth) - 1;
 
   for (let blockRow = 0; blockRow < blockRows; blockRow++) {
     const swap = previousOffsets; previousOffsets = currentOffsets; currentOffsets = swap;
@@ -185,13 +193,14 @@ function applyPlaneGrain(
         const planeRow = (y0 + y) * plane.stride + x0;
         const lumaY = (y0 + y) << subY;
         const lumaRow = lumaY * luma.stride;
+        const topOverlap = y < overlapY;
         for (let x = 0; x < width; x++) {
           let value = grain[currentBase + grainRow + x]!;
           if (x < overlapX) {
             const old = grain[leftBase + grainRow + x]!;
             value = blend(old, value, subX, x);
           }
-          if (y < overlapY) {
+          if (topOverlap) {
             let top = grain[topBase + grainRow + x]!;
             if (x < overlapX) {
               const topLeft = grain[topLeftBase + grainRow + x]!;
@@ -204,20 +213,17 @@ function applyPlaneGrain(
           const globalX = x0 + x;
           const sourceValue = sourcePlane[planeRow + x]!;
           let scalingIndex = sourceValue;
-          if (planeIndex) {
+          if (chroma) {
             const lumaX = globalX << subX;
             let average = sourceLuma[lumaRow + lumaX]!;
             if (subX) {
               const adjacentX = lumaX + 1 < luma.width ? lumaX + 1 : lumaX;
               average = (average + sourceLuma[lumaRow + adjacentX]! + 1) >> 1;
             }
-            if (data.chromaScalingFromLuma) scalingIndex = average;
+            if (chromaFromLuma) scalingIndex = average;
             else {
-              const uv = planeIndex - 1;
-              const combined = ((average * data.uvLumaMult[uv] + sourceValue * data.uvMult[uv]) >> 6) +
-                (data.uvOffset[uv] << bitDepthShift);
-              const maxIndex = (1 << sequence.bitDepth) - 1;
-              scalingIndex = combined < 0 ? 0 : combined > maxIndex ? maxIndex : combined;
+              const combined = ((average * uvLumaMult + sourceValue * uvMult) >> 6) + uvOffset;
+              scalingIndex = combined < 0 ? 0 : combined > maxScalingIndex ? maxScalingIndex : combined;
             }
           }
           const noise = round2(scaling[scalingIndex]! * value, data.scalingShift);

@@ -10,13 +10,13 @@ const SGR_PARAMETERS = [
 ] as const;
 
 interface RestorationScratch {
-  wiener: Int32Array;
+  wiener: Uint16Array;
   horizontalFilter: Int16Array;
   verticalFilter: Int16Array;
   sgrA5: Int32Array;
-  sgrB5: Int32Array;
+  sgrB5: Uint8Array;
   sgrA3: Int32Array;
-  sgrB3: Int32Array;
+  sgrB3: Uint8Array;
   rollingHorizontal: Int32Array;
   rollingHorizontalSquares: Int32Array;
   rollingVertical: Int32Array;
@@ -25,11 +25,11 @@ interface RestorationScratch {
 
 function createScratch(): RestorationScratch {
   return {
-    wiener: new Int32Array(0),
+    wiener: new Uint16Array(0),
     horizontalFilter: new Int16Array(7),
     verticalFilter: new Int16Array(7),
-    sgrA5: new Int32Array(0), sgrB5: new Int32Array(0),
-    sgrA3: new Int32Array(0), sgrB3: new Int32Array(0),
+    sgrA5: new Int32Array(0), sgrB5: new Uint8Array(0),
+    sgrA3: new Int32Array(0), sgrB3: new Uint8Array(0),
     rollingHorizontal: new Int32Array(0), rollingHorizontalSquares: new Int32Array(0),
     rollingVertical: new Int32Array(0), rollingVerticalSquares: new Int32Array(0),
   };
@@ -37,6 +37,14 @@ function createScratch(): RestorationScratch {
 
 function ensureInt32(buffer: Int32Array, length: number): Int32Array {
   return buffer.length >= length ? buffer : new Int32Array(length);
+}
+
+function ensureUint16(buffer: Uint16Array, length: number): Uint16Array {
+  return buffer.length >= length ? buffer : new Uint16Array(length);
+}
+
+function ensureUint8(buffer: Uint8Array, length: number): Uint8Array {
+  return buffer.length >= length ? buffer : new Uint8Array(length);
 }
 
 /** Apply decoded Wiener and self-guided loop-restoration units. */
@@ -100,8 +108,14 @@ function applyWiener(
   const verticalOffset = 1 << (bitDepth + roundBitsVertical - 1);
   const verticalRound = 1 << (roundBitsVertical - 1);
   const temporaryLength = (unit.height + 6) * unit.width;
-  scratch.wiener = ensureInt32(scratch.wiener, temporaryLength);
+  // The normative horizontal clip limit is at most 32768 for every supported
+  // bit depth, so the intermediate is unsigned 16-bit data, not Int32.
+  scratch.wiener = ensureUint16(scratch.wiener, temporaryLength);
   const temporary = scratch.wiener;
+  const h0 = horizontal[0]!, h1 = horizontal[1]!, h2 = horizontal[2]!, h3 = horizontal[3]!;
+  const h4 = horizontal[4]!, h5 = horizontal[5]!, h6 = horizontal[6]!;
+  const interiorStart = Math.min(unit.width, Math.max(0, 3 - unit.x));
+  const interiorEnd = Math.max(interiorStart, Math.min(unit.width, source.width - 3 - unit.x));
 
   for (let row = -3; row < unit.height + 3; row++) {
     const temporaryRow = (row + 3) * unit.width;
@@ -120,42 +134,59 @@ function applyWiener(
       sampleStride = deblocked.stride;
     }
     const sampleRow = sampleY * sampleStride;
-    for (let x = 0; x < unit.width; x++) {
+    let x = 0;
+    for (; x < interiorStart; x++) {
       const center = unit.x + x;
       let sum = horizontalOffset;
-      if (center >= 3 && center + 3 < source.width) {
-        const index = sampleRow + center;
-        sum += sampleData[index - 3]! * horizontal[0]!;
-        sum += sampleData[index - 2]! * horizontal[1]!;
-        sum += sampleData[index - 1]! * horizontal[2]!;
-        sum += sampleData[index]! * horizontal[3]!;
-        sum += sampleData[index + 1]! * horizontal[4]!;
-        sum += sampleData[index + 2]! * horizontal[5]!;
-        sum += sampleData[index + 3]! * horizontal[6]!;
-      } else {
-        for (let tap = 0; tap < 7; tap++) {
-          const sampleX = clamp(center + tap - 3, 0, source.width - 1);
-          sum += sampleData[sampleRow + sampleX]! * horizontal[tap]!;
-        }
+      for (let tap = 0; tap < 7; tap++) {
+        const sampleX = clamp(center + tap - 3, 0, source.width - 1);
+        sum += sampleData[sampleRow + sampleX]! * horizontal[tap]!;
+      }
+      temporary[temporaryRow + x] = clamp((sum + horizontalRound) >> roundBitsHorizontal, 0, clipLimit - 1);
+    }
+    let sourceIndex = sampleRow + unit.x + x;
+    for (; x < interiorEnd; x++, sourceIndex++) {
+      let sum = horizontalOffset;
+      sum += sampleData[sourceIndex - 3]! * h0;
+      sum += sampleData[sourceIndex - 2]! * h1;
+      sum += sampleData[sourceIndex - 1]! * h2;
+      sum += sampleData[sourceIndex]! * h3;
+      sum += sampleData[sourceIndex + 1]! * h4;
+      sum += sampleData[sourceIndex + 2]! * h5;
+      sum += sampleData[sourceIndex + 3]! * h6;
+      const value = (sum + horizontalRound) >> roundBitsHorizontal;
+      temporary[temporaryRow + x] = value < 0 ? 0 : value >= clipLimit ? clipLimit - 1 : value;
+    }
+    for (; x < unit.width; x++) {
+      const center = unit.x + x;
+      let sum = horizontalOffset;
+      for (let tap = 0; tap < 7; tap++) {
+        const sampleX = clamp(center + tap - 3, 0, source.width - 1);
+        sum += sampleData[sampleRow + sampleX]! * horizontal[tap]!;
       }
       temporary[temporaryRow + x] = clamp((sum + horizontalRound) >> roundBitsHorizontal, 0, clipLimit - 1);
     }
   }
 
   const maximum = (1 << bitDepth) - 1;
+  const v0 = vertical[0]!, v1 = vertical[1]!, v2 = vertical[2]!, v3 = vertical[3]!;
+  const v4 = vertical[4]!, v5 = vertical[5]!, v6 = vertical[6]!;
   for (let y = 0; y < unit.height; y++) {
+    let index = y * unit.width;
+    let destinationIndex = (unit.y + y) * destination.stride + unit.x;
     for (let x = 0; x < unit.width; x++) {
       let sum = -verticalOffset;
-      const index = y * unit.width + x;
-      sum += temporary[index]! * vertical[0]!;
-      sum += temporary[index + unit.width]! * vertical[1]!;
-      sum += temporary[index + 2 * unit.width]! * vertical[2]!;
-      sum += temporary[index + 3 * unit.width]! * vertical[3]!;
-      sum += temporary[index + 4 * unit.width]! * vertical[4]!;
-      sum += temporary[index + 5 * unit.width]! * vertical[5]!;
-      sum += temporary[index + 6 * unit.width]! * vertical[6]!;
-      destination.data[(unit.y + y) * destination.stride + unit.x + x] =
-        clamp((sum + verticalRound) >> roundBitsVertical, 0, maximum);
+      sum += temporary[index]! * v0;
+      sum += temporary[index + unit.width]! * v1;
+      sum += temporary[index + 2 * unit.width]! * v2;
+      sum += temporary[index + 3 * unit.width]! * v3;
+      sum += temporary[index + 4 * unit.width]! * v4;
+      sum += temporary[index + 5 * unit.width]! * v5;
+      sum += temporary[index + 6 * unit.width]! * v6;
+      const value = (sum + verticalRound) >> roundBitsVertical;
+      destination.data[destinationIndex] = value < 0 ? 0 : value > maximum ? maximum : value;
+      index++;
+      destinationIndex++;
     }
   }
 }
@@ -179,7 +210,7 @@ function applySelfGuided(
   let radius3: GuidedCoefficients | null = null;
   if (strength5) {
     scratch.sgrA5 = ensureInt32(scratch.sgrA5, coefficientLength);
-    scratch.sgrB5 = ensureInt32(scratch.sgrB5, coefficientLength);
+    scratch.sgrB5 = ensureUint8(scratch.sgrB5, coefficientLength);
     radius5 = buildGuidedCoefficients(
       source, deblocked, unit, 2, strength5, bitDepth, stripeStart, stripeEnd,
       scratch.sgrA5, scratch.sgrB5, scratch,
@@ -187,7 +218,7 @@ function applySelfGuided(
   }
   if (strength3) {
     scratch.sgrA3 = ensureInt32(scratch.sgrA3, coefficientLength);
-    scratch.sgrB3 = ensureInt32(scratch.sgrB3, coefficientLength);
+    scratch.sgrB3 = ensureUint8(scratch.sgrB3, coefficientLength);
     radius3 = buildGuidedCoefficients(
       source, deblocked, unit, 1, strength3, bitDepth, stripeStart, stripeEnd,
       scratch.sgrA3, scratch.sgrB3, scratch,
@@ -211,7 +242,7 @@ function applySelfGuided(
 
 interface GuidedCoefficients {
   a: Int32Array;
-  b: Int32Array;
+  b: Uint8Array;
   stride: number;
   radius: number;
 }
@@ -220,7 +251,7 @@ function buildGuidedCoefficients(
   source: Plane, deblocked: Plane, unit: Av1RestorationUnit,
   radius: number, strength: number, bitDepth: number,
   stripeStart: number, stripeEnd: number,
-  a: Int32Array, b: Int32Array, scratch: RestorationScratch,
+  a: Int32Array, b: Uint8Array, scratch: RestorationScratch,
 ): GuidedCoefficients {
   // One coefficient border is needed by the final weighted-neighbour stage.
   const stride = unit.width + 2;
@@ -257,10 +288,23 @@ function buildGuidedCoefficients(
       }
     }
 
-    const sampleY = unit.y - 1 - radius + sourceRow;
+    let sampleY = clamp(unit.y - 1 - radius + sourceRow, 0, source.height - 1);
+    let sampleData = source.data;
+    let sampleStride = source.stride;
+    if (sampleY < stripeStart) {
+      sampleY = Math.max(stripeStart - 2, sampleY);
+      sampleData = deblocked.data;
+      sampleStride = deblocked.stride;
+    } else if (sampleY > stripeEnd) {
+      sampleY = Math.min(stripeEnd + 2, sampleY);
+      sampleData = deblocked.data;
+      sampleStride = deblocked.stride;
+    }
+    const sampleRow = sampleY * sampleStride;
     let sum = 0, sumSquares = 0;
     for (let wx = -1 - radius; wx <= -1 + radius; wx++) {
-      const value = sourceSample(source, deblocked, unit.x + wx, sampleY, stripeStart, stripeEnd);
+      const sampleX = clamp(unit.x + wx, 0, source.width - 1);
+      const value = sampleData[sampleRow + sampleX]!;
       sum += value;
       sumSquares += value * value;
     }
@@ -269,12 +313,10 @@ function buildGuidedCoefficients(
     vertical[0] += sum;
     verticalSquares[0] += sumSquares;
     for (let column = 1; column < stride; column++) {
-      const removed = sourceSample(
-        source, deblocked, unit.x + column - 2 - radius, sampleY, stripeStart, stripeEnd,
-      );
-      const added = sourceSample(
-        source, deblocked, unit.x + column - 1 + radius, sampleY, stripeStart, stripeEnd,
-      );
+      const removedX = clamp(unit.x + column - 2 - radius, 0, source.width - 1);
+      const addedX = clamp(unit.x + column - 1 + radius, 0, source.width - 1);
+      const removed = sampleData[sampleRow + removedX]!;
+      const added = sampleData[sampleRow + addedX]!;
       sum += added - removed;
       sumSquares += added * added - removed * removed;
       horizontal[ringOffset + column] = sum;
@@ -342,23 +384,6 @@ function guidedResidual5(
     (b[upper - 1]! + b[upper + 1]! + b[lower - 1]! + b[lower + 1]!) * 5;
   void width;
   return (offset - factor * source + 256) >> 9;
-}
-
-function sourceSample(
-  cdef: Plane, deblocked: Plane, x: number, y: number,
-  stripeStart: number, stripeEnd: number,
-): number {
-  x = clamp(x, 0, cdef.width - 1);
-  y = clamp(y, 0, cdef.height - 1);
-  if (y < stripeStart) {
-    y = Math.max(stripeStart - 2, y);
-    return deblocked.data[y * deblocked.stride + x]!;
-  }
-  if (y > stripeEnd) {
-    y = Math.min(stripeEnd + 2, y);
-    return deblocked.data[y * deblocked.stride + x]!;
-  }
-  return cdef.data[y * cdef.stride + x]!;
 }
 
 function copyPlane(plane: Plane): Plane {
