@@ -9,6 +9,22 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./detect": {
+      "types": "./dist/detect.d.ts",
+      "import": "./dist/detect.js"
+    },
+    "./heic": {
+      "types": "./dist/heic.d.ts",
+      "import": "./dist/heic.js"
+    },
+    "./avif": {
+      "types": "./dist/avif.d.ts",
+      "import": "./dist/avif.js"
+    },
+    "./async": {
+      "types": "./dist/async.d.ts",
+      "import": "./dist/async.js"
     }
   },
   "files": [
@@ -18,7 +34,9 @@
   "scripts": {
     "build": "tsc && node tools/fix-declarations.mjs",
     "test": "node --experimental-strip-types tools/run-tests.ts",
-    "test:fuzz": "node --experimental-strip-types tools/fuzz-smoke.ts"
+    "test:fuzz": "node --experimental-strip-types tools/fuzz-smoke.ts",
+    "bench": "node --experimental-strip-types tools/benchmark.ts",
+    "bench:entries": "npm run build && node --experimental-strip-types tools/entry-benchmark.ts --dist"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

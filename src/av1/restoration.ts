@@ -9,14 +9,49 @@ const SGR_PARAMETERS = [
   [0, 1177], [0, 925], [56, 0], [22, 0],
 ] as const;
 
+interface RestorationScratch {
+  wiener: Int32Array;
+  horizontalFilter: Int16Array;
+  verticalFilter: Int16Array;
+  sgrA5: Int32Array;
+  sgrB5: Int32Array;
+  sgrA3: Int32Array;
+  sgrB3: Int32Array;
+  rollingHorizontal: Int32Array;
+  rollingHorizontalSquares: Int32Array;
+  rollingVertical: Int32Array;
+  rollingVerticalSquares: Int32Array;
+}
+
+function createScratch(): RestorationScratch {
+  return {
+    wiener: new Int32Array(0),
+    horizontalFilter: new Int16Array(7),
+    verticalFilter: new Int16Array(7),
+    sgrA5: new Int32Array(0), sgrB5: new Int32Array(0),
+    sgrA3: new Int32Array(0), sgrB3: new Int32Array(0),
+    rollingHorizontal: new Int32Array(0), rollingHorizontalSquares: new Int32Array(0),
+    rollingVertical: new Int32Array(0), rollingVerticalSquares: new Int32Array(0),
+  };
+}
+
+function ensureInt32(buffer: Int32Array, length: number): Int32Array {
+  return buffer.length >= length ? buffer : new Int32Array(length);
+}
+
 /** Apply decoded Wiener and self-guided loop-restoration units. */
 export function applyRestoration(
   frame: DecodedFrame, units: readonly Av1RestorationUnit[], sequence: Av1SequenceHeader,
   deblockedFrame: DecodedFrame = frame,
 ): void {
   if (!units.some(unit => unit.type)) return;
-  const sources = frame.planes.map(copyPlane);
-  const deblockedSources = deblockedFrame.planes.map(copyPlane);
+  const activePlanes = frame.planes.map((_, plane) => units.some(unit => unit.plane === plane && unit.type));
+  const sources = frame.planes.map((plane, index) => activePlanes[index] ? copyPlane(plane) : plane);
+  // A distinct deblocked frame is already an immutable snapshot. Copying it
+  // again doubled restoration's full-frame working set without protecting any
+  // data that this function writes.
+  const deblockedSources = deblockedFrame === frame ? sources : deblockedFrame.planes;
+  const scratch = createScratch();
   for (const unit of units) {
     if (!unit.type) continue;
     const source = sources[unit.plane]!, deblocked = deblockedSources[unit.plane]!;
@@ -40,10 +75,10 @@ export function applyRestoration(
       const end = Math.min(unitEndY, stripeEnd + 1);
       const stripeUnit = { ...unit, x, y: stripeY, width: unitEndX - x, height: end - stripeY };
       if (unit.type === 2) {
-        applyWiener(source, deblocked, destination, stripeUnit, sequence.bitDepth, stripeStart, stripeEnd);
+        applyWiener(source, deblocked, destination, stripeUnit, sequence.bitDepth, stripeStart, stripeEnd, scratch);
       } else if (unit.type === 3) {
         applySelfGuided(source, deblocked, destination, stripeUnit,
-          sequence.bitDepth, stripeStart, stripeEnd);
+          sequence.bitDepth, stripeStart, stripeEnd, scratch);
       }
       stripeY = end;
     }
@@ -53,9 +88,10 @@ export function applyRestoration(
 function applyWiener(
   source: Plane, deblocked: Plane, destination: Plane,
   unit: Av1RestorationUnit, bitDepth: number, stripeStart: number, stripeEnd: number,
+  scratch: RestorationScratch,
 ): void {
-  const horizontal = fullFilter(unit.filterHorizontal);
-  const vertical = fullFilter(unit.filterVertical);
+  const horizontal = fullFilter(unit.filterHorizontal, scratch.horizontalFilter);
+  const vertical = fullFilter(unit.filterVertical, scratch.verticalFilter);
   const roundBitsHorizontal = 3 + +(bitDepth === 12) * 2;
   const roundBitsVertical = 11 - +(bitDepth === 12) * 2;
   const horizontalOffset = 1 << (bitDepth + 6);
@@ -63,15 +99,44 @@ function applyWiener(
   const clipLimit = 1 << (bitDepth + 8 - roundBitsHorizontal);
   const verticalOffset = 1 << (bitDepth + roundBitsVertical - 1);
   const verticalRound = 1 << (roundBitsVertical - 1);
-  const temporary = new Int32Array((unit.height + 6) * unit.width);
+  const temporaryLength = (unit.height + 6) * unit.width;
+  scratch.wiener = ensureInt32(scratch.wiener, temporaryLength);
+  const temporary = scratch.wiener;
 
   for (let row = -3; row < unit.height + 3; row++) {
     const temporaryRow = (row + 3) * unit.width;
+    // All seven horizontal taps read the same source row. Resolve frame and
+    // restoration-stripe boundaries once per row instead of once per tap.
+    let sampleY = clamp(unit.y + row, 0, source.height - 1);
+    let sampleData = source.data;
+    let sampleStride = source.stride;
+    if (sampleY < stripeStart) {
+      sampleY = Math.max(stripeStart - 2, sampleY);
+      sampleData = deblocked.data;
+      sampleStride = deblocked.stride;
+    } else if (sampleY > stripeEnd) {
+      sampleY = Math.min(stripeEnd + 2, sampleY);
+      sampleData = deblocked.data;
+      sampleStride = deblocked.stride;
+    }
+    const sampleRow = sampleY * sampleStride;
     for (let x = 0; x < unit.width; x++) {
+      const center = unit.x + x;
       let sum = horizontalOffset;
-      for (let tap = 0; tap < 7; tap++) {
-        sum += sourceSample(source, deblocked, unit.x + x + tap - 3, unit.y + row,
-          stripeStart, stripeEnd) * horizontal[tap]!;
+      if (center >= 3 && center + 3 < source.width) {
+        const index = sampleRow + center;
+        sum += sampleData[index - 3]! * horizontal[0]!;
+        sum += sampleData[index - 2]! * horizontal[1]!;
+        sum += sampleData[index - 1]! * horizontal[2]!;
+        sum += sampleData[index]! * horizontal[3]!;
+        sum += sampleData[index + 1]! * horizontal[4]!;
+        sum += sampleData[index + 2]! * horizontal[5]!;
+        sum += sampleData[index + 3]! * horizontal[6]!;
+      } else {
+        for (let tap = 0; tap < 7; tap++) {
+          const sampleX = clamp(center + tap - 3, 0, source.width - 1);
+          sum += sampleData[sampleRow + sampleX]! * horizontal[tap]!;
+        }
       }
       temporary[temporaryRow + x] = clamp((sum + horizontalRound) >> roundBitsHorizontal, 0, clipLimit - 1);
     }
@@ -81,17 +146,21 @@ function applyWiener(
   for (let y = 0; y < unit.height; y++) {
     for (let x = 0; x < unit.width; x++) {
       let sum = -verticalOffset;
-      for (let tap = 0; tap < 7; tap++) {
-        sum += temporary[(y + tap) * unit.width + x]! * vertical[tap]!;
-      }
+      const index = y * unit.width + x;
+      sum += temporary[index]! * vertical[0]!;
+      sum += temporary[index + unit.width]! * vertical[1]!;
+      sum += temporary[index + 2 * unit.width]! * vertical[2]!;
+      sum += temporary[index + 3 * unit.width]! * vertical[3]!;
+      sum += temporary[index + 4 * unit.width]! * vertical[4]!;
+      sum += temporary[index + 5 * unit.width]! * vertical[5]!;
+      sum += temporary[index + 6 * unit.width]! * vertical[6]!;
       destination.data[(unit.y + y) * destination.stride + unit.x + x] =
         clamp((sum + verticalRound) >> roundBitsVertical, 0, maximum);
     }
   }
 }
 
-function fullFilter(outer: readonly number[]): Int16Array {
-  const filter = new Int16Array(7);
+function fullFilter(outer: readonly number[], filter: Int16Array): Int16Array {
   filter[0] = filter[6] = outer[0]!;
   filter[1] = filter[5] = outer[1]!;
   filter[2] = filter[4] = outer[2]!;
@@ -102,14 +171,28 @@ function fullFilter(outer: readonly number[]): Int16Array {
 function applySelfGuided(
   source: Plane, deblocked: Plane, destination: Plane,
   unit: Av1RestorationUnit, bitDepth: number, stripeStart: number, stripeEnd: number,
+  scratch: RestorationScratch,
 ): void {
   const [strength5, strength3] = SGR_PARAMETERS[unit.sgrIndex]!;
-  const radius5 = strength5 ? buildGuidedCoefficients(
-    source, deblocked, unit, 2, strength5, bitDepth, stripeStart, stripeEnd,
-  ) : null;
-  const radius3 = strength3 ? buildGuidedCoefficients(
-    source, deblocked, unit, 1, strength3, bitDepth, stripeStart, stripeEnd,
-  ) : null;
+  const coefficientLength = (unit.width + 2) * (unit.height + 2);
+  let radius5: GuidedCoefficients | null = null;
+  let radius3: GuidedCoefficients | null = null;
+  if (strength5) {
+    scratch.sgrA5 = ensureInt32(scratch.sgrA5, coefficientLength);
+    scratch.sgrB5 = ensureInt32(scratch.sgrB5, coefficientLength);
+    radius5 = buildGuidedCoefficients(
+      source, deblocked, unit, 2, strength5, bitDepth, stripeStart, stripeEnd,
+      scratch.sgrA5, scratch.sgrB5, scratch,
+    );
+  }
+  if (strength3) {
+    scratch.sgrA3 = ensureInt32(scratch.sgrA3, coefficientLength);
+    scratch.sgrB3 = ensureInt32(scratch.sgrB3, coefficientLength);
+    radius3 = buildGuidedCoefficients(
+      source, deblocked, unit, 1, strength3, bitDepth, stripeStart, stripeEnd,
+      scratch.sgrA3, scratch.sgrB3, scratch,
+    );
+  }
   const weight0 = unit.sgrWeights[0];
   const weight1 = 128 - unit.sgrWeights[0] - unit.sgrWeights[1];
   const maximum = (1 << bitDepth) - 1;
@@ -137,35 +220,80 @@ function buildGuidedCoefficients(
   source: Plane, deblocked: Plane, unit: Av1RestorationUnit,
   radius: number, strength: number, bitDepth: number,
   stripeStart: number, stripeEnd: number,
+  a: Int32Array, b: Int32Array, scratch: RestorationScratch,
 ): GuidedCoefficients {
   // One coefficient border is needed by the final weighted-neighbour stage.
   const stride = unit.width + 2;
   const rows = unit.height + 2;
-  const a = new Int32Array(stride * rows);
-  const b = new Int32Array(stride * rows);
   const window = radius * 2 + 1;
   const count = window * window;
   const reciprocal = radius === 1 ? 455 : 164;
   const bitDepthShift = bitDepth - 8;
   const squareRound = (1 << (2 * bitDepthShift)) >> 1;
   const sumRound = (1 << bitDepthShift) >> 1;
-  for (let y = -1; y <= unit.height; y++) {
-    for (let x = -1; x <= unit.width; x++) {
-      let sum = 0, sumSquares = 0;
-      for (let wy = -radius; wy <= radius; wy++) {
-        for (let wx = -radius; wx <= radius; wx++) {
-          const value = sourceSample(source, deblocked, unit.x + x + wx, unit.y + y + wy,
-            stripeStart, stripeEnd);
-          sum += value;
-          sumSquares += value * value;
-        }
+  const ringLength = stride * window;
+  scratch.rollingHorizontal = ensureInt32(scratch.rollingHorizontal, ringLength);
+  scratch.rollingHorizontalSquares = ensureInt32(scratch.rollingHorizontalSquares, ringLength);
+  scratch.rollingVertical = ensureInt32(scratch.rollingVertical, stride);
+  scratch.rollingVerticalSquares = ensureInt32(scratch.rollingVerticalSquares, stride);
+  const horizontal = scratch.rollingHorizontal;
+  const horizontalSquares = scratch.rollingHorizontalSquares;
+  const vertical = scratch.rollingVertical;
+  const verticalSquares = scratch.rollingVerticalSquares;
+  vertical.fill(0, 0, stride);
+  verticalSquares.fill(0, 0, stride);
+
+  // Form horizontal window sums once per source row, then maintain vertical
+  // rolling sums over exactly `window` rows. This is bit-equivalent to the
+  // direct square loop because all intermediates are bounded exact integers.
+  const sourceRows = rows + 2 * radius;
+  for (let sourceRow = 0; sourceRow < sourceRows; sourceRow++) {
+    const slot = sourceRow % window;
+    const ringOffset = slot * stride;
+    if (sourceRow >= window) {
+      for (let column = 0; column < stride; column++) {
+        vertical[column] -= horizontal[ringOffset + column]!;
+        verticalSquares[column] -= horizontalSquares[ringOffset + column]!;
       }
+    }
+
+    const sampleY = unit.y - 1 - radius + sourceRow;
+    let sum = 0, sumSquares = 0;
+    for (let wx = -1 - radius; wx <= -1 + radius; wx++) {
+      const value = sourceSample(source, deblocked, unit.x + wx, sampleY, stripeStart, stripeEnd);
+      sum += value;
+      sumSquares += value * value;
+    }
+    horizontal[ringOffset] = sum;
+    horizontalSquares[ringOffset] = sumSquares;
+    vertical[0] += sum;
+    verticalSquares[0] += sumSquares;
+    for (let column = 1; column < stride; column++) {
+      const removed = sourceSample(
+        source, deblocked, unit.x + column - 2 - radius, sampleY, stripeStart, stripeEnd,
+      );
+      const added = sourceSample(
+        source, deblocked, unit.x + column - 1 + radius, sampleY, stripeStart, stripeEnd,
+      );
+      sum += added - removed;
+      sumSquares += added * added - removed * removed;
+      horizontal[ringOffset + column] = sum;
+      horizontalSquares[ringOffset + column] = sumSquares;
+      vertical[column] += sum;
+      verticalSquares[column] += sumSquares;
+    }
+
+    if (sourceRow < window - 1) continue;
+    const outputRow = sourceRow - window + 1;
+    for (let column = 0; column < stride; column++) {
+      sum = vertical[column]!;
+      sumSquares = verticalSquares[column]!;
       const normalizedSquares = Math.floor((sumSquares + squareRound) / 2 ** (2 * bitDepthShift));
       const normalizedSum = Math.floor((sum + sumRound) / 2 ** bitDepthShift);
       const variance = Math.max(normalizedSquares * count - normalizedSum * normalizedSum, 0);
       const z = Math.min(255, Math.floor((variance * strength + (1 << 19)) / 2 ** 20));
       const factor = sgrXByX[z]!;
-      const index = (y + 1) * stride + x + 1;
+      const index = outputRow * stride + column;
       a[index] = Math.floor((factor * sum * reciprocal + (1 << 11)) / 2 ** 12);
       b[index] = factor;
     }
@@ -176,14 +304,17 @@ function buildGuidedCoefficients(
 function guidedResidual3(
   coefficients: GuidedCoefficients, x: number, y: number, width: number, source: number,
 ): number {
-  const index = (y + 1) * coefficients.stride + x + 1;
-  const weighted = (values: Int32Array): number =>
-    (values[index]! + values[index - 1]! + values[index + 1]! +
-      values[index - coefficients.stride]! + values[index + coefficients.stride]!) * 4 +
-    (values[index - coefficients.stride - 1]! + values[index - coefficients.stride + 1]! +
-      values[index + coefficients.stride - 1]! + values[index + coefficients.stride + 1]!) * 3;
-  const factor = weighted(coefficients.b);
-  const offset = weighted(coefficients.a);
+  const stride = coefficients.stride;
+  const index = (y + 1) * stride + x + 1;
+  const a = coefficients.a, b = coefficients.b;
+  const factor = (b[index]! + b[index - 1]! + b[index + 1]! +
+    b[index - stride]! + b[index + stride]!) * 4 +
+    (b[index - stride - 1]! + b[index - stride + 1]! +
+      b[index + stride - 1]! + b[index + stride + 1]!) * 3;
+  const offset = (a[index]! + a[index - 1]! + a[index + 1]! +
+    a[index - stride]! + a[index + stride]!) * 4 +
+    (a[index - stride - 1]! + a[index - stride + 1]! +
+      a[index + stride - 1]! + a[index + stride + 1]!) * 3;
   void width;
   return (offset - factor * source + 256) >> 9;
 }
@@ -204,11 +335,13 @@ function guidedResidual5(
   }
   const upper = y * stride + x + 1;
   const lower = (y + 2) * stride + x + 1;
-  const blend = (values: Int32Array): number =>
-    (values[upper]! + values[lower]!) * 6 +
-    (values[upper - 1]! + values[upper + 1]! + values[lower - 1]! + values[lower + 1]!) * 5;
+  const a = coefficients.a, b = coefficients.b;
+  const offset = (a[upper]! + a[lower]!) * 6 +
+    (a[upper - 1]! + a[upper + 1]! + a[lower - 1]! + a[lower + 1]!) * 5;
+  const factor = (b[upper]! + b[lower]!) * 6 +
+    (b[upper - 1]! + b[upper + 1]! + b[lower - 1]! + b[lower + 1]!) * 5;
   void width;
-  return (blend(coefficients.a) - blend(coefficients.b) * source + 256) >> 9;
+  return (offset - factor * source + 256) >> 9;
 }
 
 function sourceSample(
@@ -229,7 +362,7 @@ function sourceSample(
 }
 
 function copyPlane(plane: Plane): Plane {
-  return { width: plane.width, height: plane.height, stride: plane.stride, data: new Uint16Array(plane.data) };
+  return { width: plane.width, height: plane.height, stride: plane.stride, data: plane.data.slice() };
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {

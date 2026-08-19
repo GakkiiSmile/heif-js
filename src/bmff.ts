@@ -24,7 +24,10 @@ export interface Clap {
 export interface ImageItem {
   itemId: number;
   type: string;            // 'hvc1' | 'av01' | 'grid' | ...
-  /** coded data (for hvc1: length-prefixed NAL units; for av01: OBU stream) */
+  /**
+   * Coded data (for hvc1: length-prefixed NAL units; for av01: OBU stream).
+   * Extents are assembled and validated lazily on first access.
+   */
   data: Uint8Array;
   /** hvcC / av1C property payload (null if absent) */
   config: Uint8Array | null;
@@ -148,6 +151,9 @@ export class HeifFile {
   brands: string[] = [];
 
   parse(u8: Uint8Array, options: DecodeOptions | ResolvedDecodeLimits = {}): this {
+    // A SharedArrayBuffer can be modified by another agent while box bounds are
+    // being validated. Snapshot it once so all lazy item views remain stable.
+    if (!(u8.buffer instanceof ArrayBuffer)) u8 = new Uint8Array(u8);
     const limits = resolveDecodeLimits(options);
     this.primaryItemId = -1;
     this.items.clear();
@@ -397,56 +403,81 @@ export class HeifFile {
       if (locById.has(loc.itemId)) throw new Error(`HEIF: duplicate iloc entry for item ${loc.itemId}`);
       locById.set(loc.itemId, loc);
     }
+    // Keep item payload assembly lazy.  Real-world HEIF files commonly carry
+    // thumbnails and alternate representations that are never referenced by
+    // the primary image; eagerly concatenating all of them wastes both memory
+    // bandwidth and peak storage.  Capture this parse's item map so retained
+    // ImageItem objects remain valid even if the HeifFile instance is reused.
+    const parsedItems = new Map(this.items);
     const resolving = new Set<number>();
-    const resolved = new Set<number>();
+    const resolvedData = new Map<number, Uint8Array>();
+    let totalResolvedBytes = 0;
     const resolveData = (itemId: number): Uint8Array => {
-      const item = this.items.get(itemId);
+      const cached = resolvedData.get(itemId);
+      if (cached) return cached;
+      const item = parsedItems.get(itemId);
       if (!item) throw new Error(`HEIF: item ${itemId} referenced by iloc is missing`);
-      if (resolved.has(itemId)) return item.data;
       if (resolving.has(itemId)) throw new Error('HEIF: cyclic iloc item construction');
       if (resolving.size >= limits.maxReferenceDepth) {
         throw new ResourceLimitError(`HEIF: iloc reference depth exceeds configured limit ${limits.maxReferenceDepth}`);
       }
       resolving.add(itemId);
-      const loc = locById.get(itemId);
-      if (loc) {
-        if (loc.dataReferenceIndex !== 0) throw new Error('HEIF: external data references are not supported');
-        if (loc.extents.length === 0) throw new Error(`HEIF: item ${itemId} has no iloc extents`);
-        const chunks: Uint8Array[] = [];
-        for (const extent of loc.extents) {
-          let source: Uint8Array;
-          let offset = extent.offset;
-          if (loc.constructionMethod === 0) source = u8;
-          else if (loc.constructionMethod === 1) {
-            if (!idat) throw new Error(`HEIF: item ${itemId} references missing idat data`);
-            source = idat;
-          } else if (loc.constructionMethod === 2) {
-            const targets = item.references.iloc ?? [];
-            if (extent.indexExplicit && extent.index === 0) {
-              throw new Error(`HEIF: item ${itemId} uses the reserved iloc extent index 0`);
+      try {
+        const loc = locById.get(itemId);
+        let data: Uint8Array = new Uint8Array(0);
+        if (loc) {
+          if (loc.dataReferenceIndex !== 0) throw new Error('HEIF: external data references are not supported');
+          if (loc.extents.length === 0) throw new Error(`HEIF: item ${itemId} has no iloc extents`);
+          const chunks: Uint8Array[] = [];
+          for (const extent of loc.extents) {
+            let source: Uint8Array;
+            const offset = extent.offset;
+            if (loc.constructionMethod === 0) source = u8;
+            else if (loc.constructionMethod === 1) {
+              if (!idat) throw new Error(`HEIF: item ${itemId} references missing idat data`);
+              source = idat;
+            } else if (loc.constructionMethod === 2) {
+              const targets = item.references.iloc ?? [];
+              if (extent.indexExplicit && extent.index === 0) {
+                throw new Error(`HEIF: item ${itemId} uses the reserved iloc extent index 0`);
+              }
+              const referenceIndex = extent.index || 1;
+              const targetId = targets[referenceIndex - 1];
+              if (targetId === undefined) throw new Error(`HEIF: item ${itemId} has an invalid iloc extent index`);
+              source = resolveData(targetId);
+            } else throw new Error(`HEIF: unsupported iloc construction method ${loc.constructionMethod}`);
+            if (extent.length === 0 && loc.extents.length !== 1) {
+              throw new Error(`HEIF: item ${itemId} has an implicit length with multiple extents`);
             }
-            const referenceIndex = extent.index || 1;
-            const targetId = targets[referenceIndex - 1];
-            if (targetId === undefined) throw new Error(`HEIF: item ${itemId} has an invalid iloc extent index`);
-            source = resolveData(targetId);
-          } else throw new Error(`HEIF: unsupported iloc construction method ${loc.constructionMethod}`);
-          if (extent.length === 0 && loc.extents.length !== 1) {
-            throw new Error(`HEIF: item ${itemId} has an implicit length with multiple extents`);
+            const length = extent.length || Math.max(0, source.length - offset);
+            if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
+                offset < 0 || length < 0 || offset > source.length - length) {
+              throw new Error(`HEIF: item ${itemId} extent is out of bounds`);
+            }
+            chunks.push(source.subarray(offset, offset + length));
           }
-          const length = extent.length || Math.max(0, source.length - offset);
-          if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
-              offset < 0 || length < 0 || offset > source.length - length) {
-            throw new Error(`HEIF: item ${itemId} extent is out of bounds`);
-          }
-          chunks.push(source.subarray(offset, offset + length));
+          data = concat(chunks, limits.maxItemBytes);
         }
-        item.data = concat(chunks, limits.maxItemBytes);
+        if (data.length > limits.maxTotalItemBytes - totalResolvedBytes) {
+          throw new ResourceLimitError(
+            `HEIF: cumulative assembled item data exceeds configured limit ${limits.maxTotalItemBytes}`,
+          );
+        }
+        totalResolvedBytes += data.length;
+        resolvedData.set(itemId, data);
+        return data;
+      } finally {
+        resolving.delete(itemId);
       }
-      resolving.delete(itemId);
-      resolved.add(itemId);
-      return item.data;
     };
-    for (const itemId of this.items.keys()) resolveData(itemId);
+    for (const [itemId, item] of parsedItems) {
+      Object.defineProperty(item, 'data', {
+        configurable: true,
+        enumerable: true,
+        get: () => resolveData(itemId),
+        set: (value: Uint8Array) => { resolvedData.set(itemId, value); },
+      });
+    }
 
     for (const item of this.items.values()) {
       if (item.type !== 'grid' || item.data.length < 8) continue;
@@ -491,6 +522,10 @@ function concat(chunks: Uint8Array[], maximumLength: number): Uint8Array {
     }
     len += c.length;
   }
+  // The overwhelmingly common HEIF layout stores an item in one contiguous
+  // extent.  Keep that extent as a view of the input instead of copying the
+  // complete compressed payload before the codec immediately scans it again.
+  if (chunks.length === 1) return chunks[0]!;
   const out = new Uint8Array(len);
   let pos = 0;
   for (const c of chunks) { out.set(c, pos); pos += c.length; }

@@ -1,5 +1,6 @@
 /** HEVC inverse transforms + dequantization (spec 8.6). */
 import { LEVEL_SCALE } from './tables.ts';
+import type { SampleArray } from '../frame.ts';
 
 /** DCT-II integer approximation basis (32x32); NxN transforms use strided rows. */
 export const MAT_DCT: number[][] = [
@@ -45,13 +46,99 @@ export const MAT_DST4 = [
   [55, -84, 74, -29],
 ];
 
+const PARTIAL_SCRATCH = Symbol('hevcPartialButterflyScratch');
+type ExtendedTransformScratch = Int16Array & { [PARTIAL_SCRATCH]?: Int32Array };
+
+function getPartialScratch(buffer: Int16Array): Int32Array {
+  const extended = buffer as ExtendedTransformScratch;
+  return extended[PARTIAL_SCRATCH] ??= new Int32Array(64);
+}
+
+function inverseDct4(
+  input: ArrayLike<number>, inputOffset: number, inputStride: number,
+  output: Int32Array, outputOffset: number,
+): void {
+  const x0 = input[inputOffset]!, x1 = input[inputOffset + inputStride]!;
+  const x2 = input[inputOffset + 2 * inputStride]!, x3 = input[inputOffset + 3 * inputStride]!;
+  const even0 = 64 * (x0 + x2), even1 = 64 * (x0 - x2);
+  const odd0 = 83 * x1 + 36 * x3, odd1 = 36 * x1 - 83 * x3;
+  output[outputOffset] = even0 + odd0;
+  output[outputOffset + 1] = even1 + odd1;
+  output[outputOffset + 2] = even1 - odd1;
+  output[outputOffset + 3] = even0 - odd0;
+}
+
+function inverseDct8(
+  input: ArrayLike<number>, inputOffset: number, inputStride: number,
+  work: Int32Array, outputOffset: number, temporaryOffset: number,
+): void {
+  inverseDct4(input, inputOffset, inputStride << 1, work, temporaryOffset);
+  const x1 = input[inputOffset + inputStride]!, x3 = input[inputOffset + 3 * inputStride]!;
+  const x5 = input[inputOffset + 5 * inputStride]!, x7 = input[inputOffset + 7 * inputStride]!;
+  for (let output = 0; output < 4; output++) {
+    const odd = MAT_DCT[4]![output]! * x1 + MAT_DCT[12]![output]! * x3 +
+      MAT_DCT[20]![output]! * x5 + MAT_DCT[28]![output]! * x7;
+    const even = work[temporaryOffset + output]!;
+    work[outputOffset + output] = even + odd;
+    work[outputOffset + 7 - output] = even - odd;
+  }
+}
+
+function inverseDct16(
+  input: ArrayLike<number>, inputOffset: number, inputStride: number,
+  work: Int32Array, outputOffset: number, temporaryOffset: number,
+): void {
+  inverseDct8(input, inputOffset, inputStride << 1, work, temporaryOffset, temporaryOffset + 8);
+  for (let output = 0; output < 8; output++) {
+    let odd = 0;
+    for (let coefficient = 0; coefficient < 8; coefficient++) {
+      const value = input[inputOffset + ((coefficient << 1) + 1) * inputStride]!;
+      if (value !== 0) odd += MAT_DCT[2 * ((coefficient << 1) + 1)]![output]! * value;
+    }
+    const even = work[temporaryOffset + output]!;
+    work[outputOffset + output] = even + odd;
+    work[outputOffset + 15 - output] = even - odd;
+  }
+}
+
+function inverseDct32(
+  input: ArrayLike<number>, inputOffset: number, inputStride: number,
+  work: Int32Array, outputOffset: number, temporaryOffset: number,
+): void {
+  inverseDct16(input, inputOffset, inputStride << 1, work, temporaryOffset, temporaryOffset + 16);
+  for (let output = 0; output < 16; output++) {
+    let odd = 0;
+    for (let coefficient = 0; coefficient < 16; coefficient++) {
+      const value = input[inputOffset + ((coefficient << 1) + 1) * inputStride]!;
+      if (value !== 0) odd += MAT_DCT[(coefficient << 1) + 1]![output]! * value;
+    }
+    const even = work[temporaryOffset + output]!;
+    work[outputOffset + output] = even + odd;
+    work[outputOffset + 31 - output] = even - odd;
+  }
+}
+
+function inverseDct(
+  input: ArrayLike<number>, inputOffset: number, inputStride: number, size: number,
+  work: Int32Array,
+): void {
+  if (size === 4) inverseDct4(input, inputOffset, inputStride, work, 0);
+  else if (size === 8) inverseDct8(input, inputOffset, inputStride, work, 0, 8);
+  else if (size === 16) inverseDct16(input, inputOffset, inputStride, work, 0, 16);
+  else inverseDct32(input, inputOffset, inputStride, work, 0, 32);
+}
+
 /** dequantized coefficient block (int16) */
 export function dequant(
   coeffs: ArrayLike<number>, positions: ArrayLike<number>, nCoeffs: number,
   nT: number, qP: number, bitDepth: number,
   scalingFactors: Uint8Array | null, rotateCoeffs: boolean,
+  scratch?: Int16Array,
 ): Int16Array {
-  const out = new Int16Array(nT * nT);
+  const blockLength = nT * nT;
+  const out = scratch ?? new Int16Array(blockLength);
+  if (out.length < blockLength) throw new Error('HEVC: dequant scratch buffer is too small');
+  out.fill(0, 0, blockLength);
   let bdShift = bitDepth + Math.log2(nT) - 5;
   let m = 16;
   if (!scalingFactors) {
@@ -59,6 +146,8 @@ export function dequant(
     bdShift -= 4;
   }
   const offset = 1 << (bdShift - 1);
+  const qpScale = LEVEL_SCALE[qP % 6]! * 2 ** Math.floor(qP / 6);
+  const divisor = 2 ** bdShift;
   for (let i = 0; i < nCoeffs; i++) {
     const sourcePos = positions[i]!;
     let pos = sourcePos;
@@ -67,9 +156,9 @@ export function dequant(
       pos = nT * nT - 1 - pos;
     }
     const mf = scalingFactors ? scalingFactors[sourcePos]! : m;
-    const fact = mf * LEVEL_SCALE[qP % 6]! * 2 ** Math.floor(qP / 6);
+    const fact = mf * qpScale;
     const c = coeffs[i]!;
-    let v = Math.floor((c * fact + offset) / 2 ** bdShift);
+    let v = Math.floor((c * fact + offset) / divisor);
     if (v < -32768) v = -32768; else if (v > 32767) v = 32767;
     out[pos] = v;
   }
@@ -81,57 +170,73 @@ export function dequant(
  * `dst` true for 4x4 luma (DST instead of DCT).
  */
 export function addInverseTransform(
-  planeData: Uint16Array, stride: number, xT: number, yT: number,
+  planeData: SampleArray, stride: number, xT: number, yT: number,
   coeff: Int16Array, nT: number, bitDepth: number, useDst: boolean,
   residualOut?: Int32Array,
+  scratch?: Int16Array,
 ): void {
   const postShift = 20 - bitDepth;
   const rnd1 = 64, rnd2 = 1 << (postShift - 1);
-  const fact = nT === 4 ? 8 : nT === 8 ? 4 : nT === 16 ? 2 : 1;
-  const g = new Int16Array(nT * nT);
+  const blockLength = nT * nT;
+  const g = scratch ?? new Int16Array(blockLength);
+  if (g.length < blockLength) throw new Error('HEVC: inverse-transform scratch buffer is too small');
+  const partial = getPartialScratch(g);
 
-  // vertical pass
-  for (let c = 0; c < nT; c++) {
-    let lastCol = nT - 1;
-    while (lastCol >= 0 && coeff[c + lastCol * nT] === 0) lastCol--;
-    for (let i = 0; i < nT; i++) {
-      let sum = 0;
-      if (useDst) {
-        for (let j = 0; j < nT; j++) sum += MAT_DST4[j]![i]! * coeff[c + j * nT]!;
-      } else {
-        for (let j = 0; j <= lastCol; j++) sum += MAT_DCT[fact * j]![i]! * coeff[c + j * nT]!;
+  // Keep the fixed 4x4 DST and variable-size DCT in separate hot loops. This
+  // avoids a per-output mode branch and gives V8 stable bounds/type feedback.
+  if (useDst) {
+    for (let c = 0; c < 4; c++) {
+      for (let i = 0; i < 4; i++) {
+        let sum = 0;
+        for (let j = 0; j < 4; j++) sum += MAT_DST4[j]![i]! * coeff[c + j * 4]!;
+        let v = (sum + rnd1) >> 7;
+        if (v < -32768) v = -32768; else if (v > 32767) v = 32767;
+        g[c + i * 4] = v;
       }
-      let v = (sum + rnd1) >> 7;
-      if (v < -32768) v = -32768; else if (v > 32767) v = 32767;
-      g[c + i * nT] = v;
+    }
+  } else {
+    for (let c = 0; c < nT; c++) {
+      inverseDct(coeff, c, nT, nT, partial);
+      for (let i = 0; i < nT; i++) {
+        let v = (partial[i]! + rnd1) >> 7;
+        if (v < -32768) v = -32768; else if (v > 32767) v = 32767;
+        g[c + i * nT] = v;
+      }
     }
   }
   // horizontal pass + add
   const maxVal = (1 << bitDepth) - 1;
-  for (let y = 0; y < nT; y++) {
-    const rowOff = (yT + y) * stride + xT;
-    const gOff = y * nT;
-    for (let i = 0; i < nT; i++) {
-      let sum = 0;
-      if (useDst) {
-        for (let j = 0; j < nT; j++) sum += MAT_DST4[j]![i]! * g[gOff + j]!;
-      } else {
-        for (let j = 0; j < nT; j++) {
-          const cval = g[gOff + j]!;
-          if (cval !== 0) sum += MAT_DCT[fact * j]![i]! * cval;
-        }
+  if (useDst) {
+    for (let y = 0; y < 4; y++) {
+      const rowOff = (yT + y) * stride + xT;
+      const gOff = y * 4;
+      for (let i = 0; i < 4; i++) {
+        let sum = 0;
+        for (let j = 0; j < 4; j++) sum += MAT_DST4[j]![i]! * g[gOff + j]!;
+        const out = (sum + rnd2) >> postShift;
+        if (residualOut) residualOut[i + y * 4] = out;
+        const v = planeData[rowOff + i]! + out;
+        planeData[rowOff + i] = v < 0 ? 0 : v > maxVal ? maxVal : v;
       }
-      const out = (sum + rnd2) >> postShift;
-      if (residualOut) residualOut[i + y * nT] = out;
-      const v = planeData[rowOff + i]! + out;
-      planeData[rowOff + i] = v < 0 ? 0 : v > maxVal ? maxVal : v;
+    }
+  } else {
+    for (let y = 0; y < nT; y++) {
+      const rowOff = (yT + y) * stride + xT;
+      const gOff = y * nT;
+      inverseDct(g, gOff, 1, nT, partial);
+      for (let i = 0; i < nT; i++) {
+        const out = (partial[i]! + rnd2) >> postShift;
+        if (residualOut) residualOut[i + y * nT] = out;
+        const v = planeData[rowOff + i]! + out;
+        planeData[rowOff + i] = v < 0 ? 0 : v > maxVal ? maxVal : v;
+      }
     }
   }
 }
 
 /** transform skip: residual = coeff << 7-ish scaling (8.6.3 bypass transform) */
 export function addTransformSkip(
-  planeData: Uint16Array, stride: number, xT: number, yT: number,
+  planeData: SampleArray, stride: number, xT: number, yT: number,
   coeff: Int16Array, nT: number, bitDepth: number, rdpcmMode = 0, extendedPrecision = false,
   residualOut?: Int32Array,
 ): void {
@@ -139,7 +244,7 @@ export function addTransformSkip(
   const tsShift = (extendedPrecision ? Math.min(5, bdShift - 2) : 5) + Math.log2(nT);
   const rnd = 1 << (bdShift - 1);
   const maxVal = (1 << bitDepth) - 1;
-  const residual = new Int32Array(nT * nT);
+  const residual = residualOut ?? new Int32Array(nT * nT);
   for (let y = 0; y < nT; y++) {
     for (let x = 0; x < nT; x++) {
       const c = coeff[x + y * nT]!;
@@ -147,7 +252,7 @@ export function addTransformSkip(
       if (rdpcmMode === 1 && x > 0) out += residual[x - 1 + y * nT]!;
       else if (rdpcmMode === 2 && y > 0) out += residual[x + (y - 1) * nT]!;
       residual[x + y * nT] = out;
-      if (residualOut) residualOut[x + y * nT] = out;
+      // `residual` aliases residualOut when the caller supplies reusable storage.
       const v = planeData[(yT + y) * stride + xT + x]! + out;
       planeData[(yT + y) * stride + xT + x] = v < 0 ? 0 : v > maxVal ? maxVal : v;
     }

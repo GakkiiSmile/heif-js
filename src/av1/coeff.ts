@@ -9,6 +9,14 @@ export interface CoefficientResult {
   context: number;
 }
 
+// Skipped transforms never read coefficient storage during reconstruction.
+// Sharing one empty view avoids allocating and retaining a zero-filled block for
+// every all-skip transform in sparse images.
+const EMPTY_COEFFICIENTS = new Int32Array(0);
+const TOKEN_SCRATCH = new Int32Array(32 * 32);
+const LEVEL_SCRATCH = new Uint8Array(32 * 34 + 8);
+const POSITION_SCRATCH = new Uint16Array(32 * 32);
+
 interface CoefficientOptions {
   msac: MsacDecoder;
   modeCdf: Record<string, any>;
@@ -37,12 +45,12 @@ export function decodeCoefficients(options: CoefficientOptions): CoefficientResu
   const info = transformSizes[tx]!;
   const width = Math.min(info.w4, 8) * 4;
   const height = Math.min(info.h4, 8) * 4;
-  const coefficients = new Int32Array(width * height);
   const skipContext = getSkipContext(info, blockSize, above, left, !!chroma, subsamplingX, subsamplingY);
   const allSkip = msac.boolAdapt(coefCdf.skip[info.ctx][skipContext]);
   if (allSkip) {
-    return { eob: -1, txType: lossless ? 16 : 0, coefficients, context: 0x40 };
+    return { eob: -1, txType: lossless ? 16 : 0, coefficients: EMPTY_COEFFICIENTS, context: 0x40 };
   }
+  const coefficients = new Int32Array(width * height);
 
   let txType: number;
   if (lossless) txType = 16;
@@ -83,73 +91,79 @@ export function decodeCoefficients(options: CoefficientOptions): CoefficientResu
     eob = ((high | 2) << eobBin) | msac.bools(eobBin);
   }
 
-  const tokens = new Int32Array(width * height);
+  const tokens = TOKEN_SCRATCH;
   // 2-D transforms use the transform height as their column-major stride.
   // AV1's 1-D coefficient contexts use a fixed padded stride of 16.
   const levelsStride = txClass === 0 ? height : 16;
-  const levels = new Uint8Array(levelsStride * (Math.max(width, height) + 2) + 8);
+  const levelsLength = levelsStride * (Math.max(width, height) + 2) + 8;
+  const levels = LEVEL_SCRATCH;
+  levels.fill(0, 0, levelsLength);
   const scan = coefficientScan(tx);
   const eobBase = coefCdf.eob_base_tok[info.ctx][chroma];
   const base = coefCdf.base_tok[info.ctx][chroma];
   const high = coefCdf.br_tok[Math.min(info.ctx, 3)][chroma];
-  const positions: { rc: number; scanIndex: number }[] = [];
+  const positions = POSITION_SCRATCH;
+  let positionCount = 0;
   let dcToken = 0;
-
-  const positionFor = (index: number): { rc: number; x: number; y: number; levelIndex: number } => {
-    if (txClass === 0) {
-      const rc = scan[index]!;
-      return { rc, x: Math.floor(rc / height), y: rc % height, levelIndex: rc };
-    }
-    const mask = (txClass === 1 ? height : width) - 1;
-    const x = index & mask, y = index >> Math.log2(mask + 1);
-    return txClass === 1
-      ? { rc: index, x, y, levelIndex: x * 16 + y }
-      : { rc: x * height + y, x, y, levelIndex: x * 16 + y };
-  };
+  const classMask = (txClass === 1 ? height : width) - 1;
+  const classShift = Math.log2(classMask + 1);
 
   if (eob) {
     let context = 1 + +(eob > 2 << sizeContext) + +(eob > 4 << sizeContext);
     let token = msac.symbol(eobBase[context], 2) + 1;
-    let p = positionFor(eob);
-    if (token === 3) {
-      context = (txClass === 0 ? ((p.x | p.y) > 1) : p.y !== 0) ? 14 : 7;
-      token = msac.hiToken(high[context]);
-      levels[p.levelIndex] = token + (3 << 6);
+    let rc: number, x: number, y: number, levelIndex: number;
+    if (txClass === 0) {
+      rc = scan[eob]!; x = Math.floor(rc / height); y = rc % height; levelIndex = rc;
     } else {
-      levels[p.levelIndex] = token * 0x41;
+      x = eob & classMask; y = eob >> classShift;
+      rc = txClass === 1 ? eob : x * height + y;
+      levelIndex = x * 16 + y;
     }
-    tokens[p.rc] = token;
-    positions.push({ rc: p.rc, scanIndex: eob });
+    if (token === 3) {
+      context = (txClass === 0 ? ((x | y) > 1) : y !== 0) ? 14 : 7;
+      token = msac.hiToken(high[context]);
+      levels[levelIndex] = token + (3 << 6);
+    } else {
+      levels[levelIndex] = token * 0x41;
+    }
+    tokens[rc] = token;
+    positions[positionCount++] = rc;
 
     const nonsquare = tx >= 5 ? 1 : 0;
     const offsetTable = lo_ctx_offsets[nonsquare + (tx & nonsquare)]!;
     for (let index = eob - 1; index > 0; index--) {
-      p = positionFor(index);
-      const lo = getLowContext(levels, levelsStride, txClass, offsetTable, p.x, p.y, p.levelIndex);
-      token = msac.symbol(base[lo.context], 3);
+      if (txClass === 0) {
+        rc = scan[index]!; x = Math.floor(rc / height); y = rc % height; levelIndex = rc;
+      } else {
+        x = index & classMask; y = index >> classShift;
+        rc = txClass === 1 ? index : x * height + y;
+        levelIndex = x * 16 + y;
+      }
+      const low = getLowContext(levels, levelsStride, txClass, offsetTable, x, y, levelIndex);
+      token = msac.symbol(base[low & 0xff], 3);
       if (token === 3) {
-        const axis = txClass === 0 ? p.x | p.y : p.y;
-        const magnitude = lo.highMagnitude & 63;
+        const axis = txClass === 0 ? x | y : y;
+        const magnitude = (low >>> 8) & 63;
         context = (axis > (txClass === 0 ? 1 : 0) ? 14 : 7) +
           (magnitude > 12 ? 6 : (magnitude + 1) >> 1);
         token = msac.hiToken(high[context]);
-        levels[p.levelIndex] = token + (3 << 6);
+        levels[levelIndex] = token + (3 << 6);
       } else {
-        levels[p.levelIndex] = token * 0x41;
+        levels[levelIndex] = token * 0x41;
       }
       if (token) {
-        tokens[p.rc] = token;
-        positions.push({ rc: p.rc, scanIndex: index });
+        tokens[rc] = token;
+        positions[positionCount++] = rc;
       }
     }
 
     const dcContext = txClass === 0 ? 0 :
-      getLowContext(levels, levelsStride, txClass, offsetTable, 0, 0, 0).context;
+      getLowContext(levels, levelsStride, txClass, offsetTable, 0, 0, 0) & 0xff;
     dcToken = msac.symbol(base[dcContext], 3);
     if (dcToken === 3) {
       let magnitude: number;
       if (txClass === 0) magnitude = (levels[1]! + levels[levelsStride]! + levels[levelsStride + 1]!) & 63;
-      else magnitude = getLowContext(levels, levelsStride, txClass, offsetTable, 0, 0, 0).highMagnitude & 63;
+      else magnitude = (getLowContext(levels, levelsStride, txClass, offsetTable, 0, 0, 0) >>> 8) & 63;
       const context = magnitude > 12 ? 6 : (magnitude + 1) >> 1;
       dcToken = msac.hiToken(high[context]);
     }
@@ -171,14 +185,16 @@ export function decodeCoefficients(options: CoefficientOptions): CoefficientResu
     cumulativeLevel = dcToken;
     dcSignLevel = (sign - 1) & (2 << 6);
   }
-  positions.sort((a, b) => a.scanIndex - b.scanIndex);
-  for (const position of positions) {
-    let token = tokens[position.rc]!;
+  // Positions were discovered from the end of the scan towards DC. Read sign
+  // bits in normative ascending scan order by walking the compact buffer back.
+  for (let position = positionCount - 1; position >= 0; position--) {
+    const rc = positions[position]!;
+    let token = tokens[rc]!;
     const sign = msac.boolEqui();
     if (token === 15) {
       token = readGolomb(msac) + 15;
     }
-    coefficients[position.rc] = sign ? -token : token;
+    coefficients[rc] = sign ? -token : token;
     cumulativeLevel += token;
   }
 
@@ -205,19 +221,22 @@ function getSkipContext(info: typeof transformSizes[number], blockSize: number,
   if (chroma) {
     const notOneBlock = dimensions[2] - +(!!dimensions[2] && !!subsamplingX) > info.logW ||
       dimensions[3] - +(!!dimensions[3] && !!subsamplingY) > info.logH;
-    const ca = +above.subarray(0, 1 << info.logW).some(value => value !== 0x40);
-    const cl = +left.subarray(0, 1 << info.logH).some(value => value !== 0x40);
+    let ca = 0, cl = 0;
+    const aboveLength = Math.min(above.length, 1 << info.logW);
+    const leftLength = Math.min(left.length, 1 << info.logH);
+    for (let i = 0; i < aboveLength; i++) ca ||= +(above[i] !== 0x40);
+    for (let i = 0; i < leftLength; i++) cl ||= +(left[i] !== 0x40);
     return 7 + +notOneBlock * 3 + ca + cl;
   }
   if (dimensions[2] === info.logW && dimensions[3] === info.logH) return 0;
   let a = 0, l = 0;
-  for (const value of above.subarray(0, info.w4)) a |= value;
-  for (const value of left.subarray(0, info.h4)) l |= value;
+  for (let i = 0; i < info.w4; i++) a |= above[i]!;
+  for (let i = 0; i < info.h4; i++) l |= left[i]!;
   return skip_ctx[Math.min(a & 0x3f, 4)]![Math.min(l & 0x3f, 4)]!;
 }
 
 function getLowContext(levels: Uint8Array, stride: number, txClass: number,
-  offsets: number[][], x: number, y: number, index: number): { context: number; highMagnitude: number } {
+  offsets: number[][], x: number, y: number, index: number): number {
   let magnitude = levels[index + 1]! + levels[index + stride]!;
   let highMagnitude = magnitude;
   let offset: number;
@@ -232,13 +251,13 @@ function getLowContext(levels: Uint8Array, stride: number, txClass: number,
     magnitude += levels[index + 3]! + levels[index + 4]!;
     offset = 26 + (y > 1 ? 10 : y * 5);
   }
-  return { context: offset + (magnitude > 512 ? 4 : (magnitude + 64) >> 7), highMagnitude };
+  return (offset + (magnitude > 512 ? 4 : (magnitude + 64) >> 7)) | (highMagnitude << 8);
 }
 
 function getDcSignContext(above: Uint8Array, left: Uint8Array, width: number, height: number): number {
   let sum = -width - height;
-  for (const value of above.subarray(0, width)) sum += value >> 6;
-  for (const value of left.subarray(0, height)) sum += value >> 6;
+  for (let i = 0; i < width; i++) sum += above[i]! >> 6;
+  for (let i = 0; i < height; i++) sum += left[i]! >> 6;
   return +(sum !== 0) + +(sum > 0);
 }
 

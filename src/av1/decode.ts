@@ -66,6 +66,8 @@ export interface Av1RestorationUnit {
   sgrWeights: [number, number];
 }
 
+const EMPTY_RECONSTRUCTION_PAYLOAD = new Int32Array(0);
+
 export class Av1Decoder {
   private readonly limits: ResolvedDecodeLimits;
 
@@ -114,24 +116,28 @@ export class Av1Decoder {
     const sbStep4 = sequence.sb128 ? 32 : 16;
     let finalRange = 0;
     for (const payload of tilePayloads) {
-      const tile = new TileDecoder(sequence, header, frame, payload.data, {
+      const bounds = {
         startX: header.tileColStarts[payload.column]! * sbStep4,
         endX: Math.min(Math.ceil(header.width / 4), header.tileColStarts[payload.column + 1]! * sbStep4),
         startY: header.tileRowStarts[payload.row]! * sbStep4,
         endY: Math.min(Math.ceil(header.height / 4), header.tileRowStarts[payload.row + 1]! * sbStep4),
-      });
+      };
+      const tile = new TileDecoder(sequence, header, frame, payload.data, bounds);
       const tileBlocks = tile.decode();
-      reconstructAv1Frame(frame.planes, tileBlocks, sequence, header);
+      reconstructAv1Frame(frame.planes, tileBlocks, sequence, header, bounds);
+      releaseReconstructionPayloads(tileBlocks);
       blocks.push(...tileBlocks);
       restorationUnits.push(...tile.restorationUnits);
       finalRange = tile.msac.range;
     }
     if (!debugEnabled('AV1_DISABLE_DEBLOCK')) applyDeblock(frame, blocks, sequence, header);
-    const deblockedFrame = header.restorationTypes.some(Boolean) ? cloneFrame(frame) : null;
+    const restorationEnabled = !debugEnabled('AV1_DISABLE_RESTORATION');
+    const hasRestoration = restorationEnabled && restorationUnits.some(unit => unit.type);
+    const deblockedFrame = hasRestoration ? cloneFrame(frame) : null;
     if (!debugEnabled('AV1_DISABLE_CDEF')) applyCdef(frame, blocks, sequence, header);
     const outputFrame = debugEnabled('AV1_DISABLE_SUPERRES') ? frame :
       upscaleAv1Frame(frame, header.upscaledWidth, header.width);
-    if (!debugEnabled('AV1_DISABLE_RESTORATION')) {
+    if (restorationEnabled) {
       const upscaledDeblocked = deblockedFrame ?
         upscaleAv1Frame(deblockedFrame, header.upscaledWidth, header.width) : outputFrame;
       applyRestoration(outputFrame, restorationUnits, sequence, upscaledDeblocked);
@@ -145,6 +151,24 @@ export class Av1Decoder {
       finalRange,
       restorationUnits,
     };
+  }
+}
+
+function releaseReconstructionPayloads(blocks: Av1DecodedBlock[]): void {
+  for (const block of blocks) {
+    // Deblocking only needs transform positions for IntraBC luma blocks. All
+    // decoded coefficient values and every chroma unit have already been
+    // consumed by reconstruction at this point.
+    if (block.intrabc) {
+      for (const unit of block.yCoefficients) unit.result.coefficients = EMPTY_RECONSTRUCTION_PAYLOAD;
+    } else {
+      block.yCoefficients.length = 0;
+    }
+    block.uvCoefficients.length = 0;
+    block.yPalette = null;
+    block.uvPalette = null;
+    block.yPaletteIndices = null;
+    block.uvPaletteIndices = null;
   }
 }
 
@@ -170,6 +194,7 @@ class TileDecoder {
   private readonly coefCdf: any;
   private readonly width4: number;
   private readonly height4: number;
+  private readonly mapWidth4: number;
   private readonly bounds: TileBounds;
   private readonly ssX: number;
   private readonly ssY: number;
@@ -230,12 +255,13 @@ class TileDecoder {
     this.cdf = mutableCdf(defaultCdf) as any;
     // The default table stores one initializer, but vertical and horizontal
     // MV components adapt independently in the normative decoder state.
-    this.cdf.mv.comp = [this.cdf.mv.comp, structuredClone(this.cdf.mv.comp)];
+    this.cdf.mv.comp = [this.cdf.mv.comp, mutableCdf(this.cdf.mv.comp)];
     const qCategory = +(header.baseQIdx > 20) + +(header.baseQIdx > 60) + +(header.baseQIdx > 120);
     this.coefCdf = mutableCdf(defaultCoefCdf[qCategory]) as any;
     this.width4 = Math.ceil(header.width / 4);
     this.height4 = Math.ceil(header.height / 4);
     this.bounds = bounds;
+    this.mapWidth4 = bounds.endX - bounds.startX;
     this.ssX = sequence.monochrome ? 0 : sequence.subsamplingX;
     this.ssY = sequence.monochrome ? 0 : sequence.subsamplingY;
     this.maxTransformChroma = this.ssX ? (this.ssY ? maxTransform420 : maxTransform422) : maxTransform444;
@@ -259,12 +285,13 @@ class TileDecoder {
     this.abovePalY = Array.from({ length: this.width4 }, () => []);
     this.abovePalSizeUv = new Uint8Array(this.width4);
     this.abovePalUv = Array.from({ length: this.width4 }, () => [[], []]);
-    this.intrabcMvValid = new Uint8Array(this.width4 * this.height4);
-    this.intrabcMvX = new Int32Array(this.width4 * this.height4);
-    this.intrabcMvY = new Int32Array(this.width4 * this.height4);
-    this.blockSizeMap = new Uint8Array(this.width4 * this.height4);
-    this.lumaTxType = new Int8Array(this.width4 * this.height4);
-    this.segmentMap = new Uint8Array(this.width4 * this.height4);
+    const mapSize = this.mapWidth4 * (bounds.endY - bounds.startY);
+    this.intrabcMvValid = new Uint8Array(mapSize);
+    this.intrabcMvX = new Int32Array(mapSize);
+    this.intrabcMvY = new Int32Array(mapSize);
+    this.blockSizeMap = new Uint8Array(mapSize);
+    this.lumaTxType = new Int8Array(mapSize);
+    this.segmentMap = new Uint8Array(mapSize);
     this.lastQIdx = header.baseQIdx;
   }
 
@@ -675,19 +702,19 @@ class TileDecoder {
   private readSegmentId(
     bx: number, by: number, haveTop: boolean, haveLeft: boolean, skip: boolean,
   ): number {
-    const index = by * this.width4 + bx;
+    const index = this.mapIndex(bx, by);
     let context = 0, predicted = 0;
     if (haveTop && haveLeft) {
       const left = this.segmentMap[index - 1]!;
-      const above = this.segmentMap[index - this.width4]!;
-      const aboveLeft = this.segmentMap[index - this.width4 - 1]!;
+      const above = this.segmentMap[index - this.mapWidth4]!;
+      const aboveLeft = this.segmentMap[index - this.mapWidth4 - 1]!;
       context = left === above && aboveLeft === left ? 2 :
         left === above || aboveLeft === left || above === aboveLeft ? 1 : 0;
       predicted = above === aboveLeft ? above : left;
     } else if (haveLeft) {
       predicted = this.segmentMap[index - 1]!;
     } else if (haveTop) {
-      predicted = this.segmentMap[index - this.width4]!;
+      predicted = this.segmentMap[index - this.mapWidth4]!;
     }
     if (skip) return predicted;
     const difference = this.msac.symbol(this.cdf.m.seg_id[context], 7);
@@ -762,7 +789,7 @@ class TileDecoder {
                 reducedTransformSet: this.header.reducedTransformSet, qIdx: blockQIdx,
                 lossless: this.header.segmentLossless[segmentId],
                 subsamplingX: this.ssX, subsamplingY: this.ssY,
-                lumaTxType: this.lumaTxType[lumaY * this.width4 + lumaX]!,
+                lumaTxType: this.lumaTxType[this.mapIndex(lumaX, lumaY)]!,
                 above: this.aboveCcoef[plane].subarray(cbx + x),
                 left: this.leftCcoef[plane].subarray(cby + y),
               });
@@ -829,7 +856,7 @@ class TileDecoder {
     // Top-right is only eligible if that block has already been decoded. The
     // decoded-map test is the practical equivalent of the partition edge flag.
     if (by > this.bounds.startY && Math.max(bw4, bh4) <= 16 && bx + bw4 < this.bounds.endX &&
-        this.intrabcMvValid[(by - 1) * this.width4 + bx + bw4]) {
+        this.intrabcMvValid[this.mapIndex(bx + bw4, by - 1)]) {
       this.addMvCandidate(candidates, bx + bw4, by - 1, 4);
     }
 
@@ -875,7 +902,7 @@ class TileDecoder {
   ): boolean {
     if (x4 < this.bounds.startX || y4 < this.bounds.startY ||
         x4 >= this.bounds.endX || y4 >= this.bounds.endY) return false;
-    const index = y4 * this.width4 + x4;
+    const index = this.mapIndex(x4, y4);
     if (!this.intrabcMvValid[index]) return false;
     const x = this.intrabcMvX[index]!, y = this.intrabcMvY[index]!;
     const existing = candidates.find(candidate => candidate.x === x && candidate.y === y);
@@ -891,7 +918,7 @@ class TileDecoder {
     if (y4 < this.bounds.startY || x4 < this.bounds.startX ||
         y4 >= this.bounds.endY || x4 >= this.bounds.endX) return 1;
     let candidateX = x4;
-    let dimensions = block_dimensions[this.blockSizeMap[y4 * this.width4 + candidateX]!]!;
+    let dimensions = block_dimensions[this.blockSizeMap[this.mapIndex(candidateX, y4)]!]!;
     let candidateWidth = dimensions[0]!;
     let length = Math.max(step, Math.min(bw4, candidateWidth));
     if (bw4 <= candidateWidth) {
@@ -904,7 +931,7 @@ class TileDecoder {
       x += length;
       if (x >= w4) return 1;
       candidateX = x4 + x;
-      dimensions = block_dimensions[this.blockSizeMap[y4 * this.width4 + candidateX]!]!;
+      dimensions = block_dimensions[this.blockSizeMap[this.mapIndex(candidateX, y4)]!]!;
       candidateWidth = dimensions[0]!;
       length = Math.max(step, candidateWidth);
     }
@@ -917,7 +944,7 @@ class TileDecoder {
     if (y4 < this.bounds.startY || x4 < this.bounds.startX ||
         y4 >= this.bounds.endY || x4 >= this.bounds.endX) return 1;
     let candidateY = y4;
-    let dimensions = block_dimensions[this.blockSizeMap[candidateY * this.width4 + x4]!]!;
+    let dimensions = block_dimensions[this.blockSizeMap[this.mapIndex(x4, candidateY)]!]!;
     let candidateHeight = dimensions[1]!;
     let length = Math.max(step, Math.min(bh4, candidateHeight));
     if (bh4 <= candidateHeight) {
@@ -930,7 +957,7 @@ class TileDecoder {
       y += length;
       if (y >= h4) return 1;
       candidateY = y4 + y;
-      dimensions = block_dimensions[this.blockSizeMap[candidateY * this.width4 + x4]!]!;
+      dimensions = block_dimensions[this.blockSizeMap[this.mapIndex(x4, candidateY)]!]!;
       candidateHeight = dimensions[1]!;
       length = Math.max(step, candidateHeight);
     }
@@ -1073,9 +1100,13 @@ class TileDecoder {
 
   private fillLumaTxType(x4: number, y4: number, width4: number, height4: number, txType: number): void {
     for (let y = y4; y < Math.min(this.bounds.endY, y4 + height4); y++) {
-      this.lumaTxType.fill(txType, y * this.width4 + x4,
-        y * this.width4 + Math.min(this.bounds.endX, x4 + width4));
+      const start = this.mapIndex(x4, y);
+      this.lumaTxType.fill(txType, start, start + Math.min(this.bounds.endX - x4, width4));
     }
+  }
+
+  private mapIndex(x4: number, y4: number): number {
+    return (y4 - this.bounds.startY) * this.mapWidth4 + x4 - this.bounds.startX;
   }
 
   private readPalettePlane(plane: number, sizeContext: number, bx: number, byLocal: number): number[] {
@@ -1175,7 +1206,7 @@ class TileDecoder {
 
     for (let y = 0; y < bh4 && by + y < this.bounds.endY; y++) {
       for (let x = 0; x < bw4 && bx + x < this.bounds.endX; x++) {
-        const index = (by + y) * this.width4 + bx + x;
+        const index = this.mapIndex(bx + x, by + y);
         this.blockSizeMap[index] = block.blockSize;
         this.segmentMap[index] = block.segmentId;
         this.intrabcMvValid[index] = +intrabc;

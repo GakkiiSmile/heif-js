@@ -1,13 +1,18 @@
 /** HEVC slice decoder: header parsing, CTU/CU/TU syntax, residual coding (H.265 §7.3, §9.3). */
 import { BitReader } from './bitreader.ts';
-import { Cabac, CTX } from './cabac.ts';
+import { Cabac, CTX, captureCabacDebugOptions } from './cabac.ts';
+import type { CabacDebugOptions } from './cabac.ts';
 import { parseSps, parsePps, skipShortTermRefPicSet } from './pps.ts';
 import type { Spt, Pps, ScalingLists } from './pps.ts';
-import { NAL_SPS, NAL_PPS } from './nal.ts';
+import { NAL_SPS, NAL_PPS, countSkippedBytesInRange, rbspOffsetToEbsp } from './nal.ts';
 import type { HevcNal } from './nal.ts';
 import { DecodedFrame, CHROMA_MONO, CHROMA_420, CHROMA_422, CHROMA_444 } from '../frame.ts';
+import type { SampleArray } from '../frame.ts';
 import { SCAN, CHROMA_QP } from './tables.ts';
-import { intraPredict, fillIntraPredModeCandidates, intraPredModeDecode, chromaPredMode } from './intra.ts';
+import {
+  chromaPredMode, createIntraScratch, fillIntraPredModeCandidates, intraPredict, intraPredModeDecode,
+} from './intra.ts';
+import type { IntraCtx } from './intra.ts';
 import { dequant, addInverseTransform, addTransformSkip } from './transform.ts';
 import { applySao } from './sao.ts';
 import { applyDeblock } from './deblock.ts';
@@ -16,9 +21,35 @@ import { debugEnabled, debugValue, debugWrite } from '../debug.ts';
 import { assertDimensions, resolveDecodeLimits } from '../limits.ts';
 import type { DecodeOptions, ResolvedDecodeLimits } from '../limits.ts';
 
+interface HevcDebugOptions {
+  cabac: CabacDebugOptions;
+  trace: boolean;
+  tuDebug: boolean;
+  tuX: number;
+  tuY: number;
+  tuComponent: number;
+  disableScaling: boolean;
+  disableDeblock: boolean;
+  disableSao: boolean;
+  disableCrossComponent: boolean;
+}
 
-const TRACE = debugEnabled('HEVC_TRACE');
-function tr(sym: string, val: number | string) { if (TRACE) debugWrite(`[tr] ${sym}=${val}\n`); }
+/** Read environment-driven diagnostics once at the start of each frame. */
+function captureHevcDebugOptions(): HevcDebugOptions {
+  const cabac = captureCabacDebugOptions();
+  return {
+    cabac,
+    trace: cabac.stateTrace,
+    tuDebug: debugEnabled('HEVC_TU_DEBUG'),
+    tuX: +(debugValue('HEVC_TU_X') ?? 0),
+    tuY: +(debugValue('HEVC_TU_Y') ?? 0),
+    tuComponent: +(debugValue('HEVC_TU_C') ?? 0),
+    disableScaling: debugEnabled('HEVC_DISABLE_SCALING'),
+    disableDeblock: debugEnabled('HEVC_DISABLE_DEBLOCK'),
+    disableSao: debugEnabled('HEVC_DISABLE_SAO'),
+    disableCrossComponent: debugEnabled('HEVC_DISABLE_CROSS_COMPONENT'),
+  };
+}
 
 const SIG_MAP_4x4 = [0, 1, 4, 5, 2, 3, 4, 5, 6, 6, 8, 8, 7, 7, 8, 9];
 const CHROMA_422_MODE = [
@@ -54,13 +85,14 @@ export class HevcDecoder {
   }
 
   decodeFrame(sliceNals: HevcNal[]): DecodedFrame {
+    const debug = captureHevcDebugOptions();
     const slices = sliceNals.filter(n => n.type <= 21);
     if (!slices.length) throw new Error('HEVC: picture has no slice NAL units');
     const colourPlanes = splitSeparateColourPlaneSlices(this, slices);
     if (colourPlanes) {
       const decoded = colourPlanes.map((planeSlices, plane) => {
         if (!planeSlices.length) throw new Error(`HEVC: separate colour plane ${plane} has no slices`);
-        return new SliceDecoder(this).decode(planeSlices);
+        return new SliceDecoder(this, debug).decode(planeSlices);
       });
       const first = decoded[0]!;
       if (decoded.some(frame => frame.width !== first.width || frame.height !== first.height ||
@@ -71,7 +103,7 @@ export class HevcDecoder {
       for (let plane = 0; plane < 3; plane++) output.planes[plane]!.data.set(decoded[plane]!.luma.data);
       return output;
     }
-    return new SliceDecoder(this).decode(slices);
+    return new SliceDecoder(this, debug).decode(slices);
   }
 }
 
@@ -201,9 +233,31 @@ class SliceDecoder {
   private lumaResidual = new Int32Array(32 * 32);
   private lumaResidualStride = 32;
   private componentResidual = new Int32Array(32 * 32);
+  private crossPrediction = new Int32Array(32 * 32);
+  private transformCoeff = new Int16Array(32 * 32);
+  private transformIntermediate = new Int16Array(32 * 32);
+  private csbfNeighbors = new Uint8Array(8 * 8);
+  private subblockCoeffValue = new Int32Array(16);
+  private subblockCoeffScanPos = new Uint8Array(16);
+  private subblockCoeffMaxBase = new Uint8Array(16);
+  private subblockSigns = new Uint8Array(16);
+  private modeScratch = new Int8Array(4);
+  private prevFlagScratch = new Uint8Array(4);
+  private chromaIdxScratch = new Int8Array(4);
+  private candidateModeScratch = [0, 0, 0];
+  private intraCtx!: IntraCtx;
+  private intraScratch = createIntraScratch();
 
   private dec: HevcDecoder;
-  constructor(dec: HevcDecoder) { this.dec = dec; }
+  private debug: HevcDebugOptions;
+  constructor(dec: HevcDecoder, debug: HevcDebugOptions) {
+    this.dec = dec;
+    this.debug = debug;
+  }
+
+  private tr(sym: string, val: number | string): void {
+    debugWrite(`[tr] ${sym}=${val}\n`);
+  }
 
   decode(nals: HevcNal[]): DecodedFrame {
     const nal = nals[0]!;
@@ -282,19 +336,8 @@ class SliceDecoder {
     r.u1(); // alignment_bit_equal_to_one
     r.byteAlign();
     const dataStart = r.pos >> 3;
-    tr('slice_data_start', dataStart);
-    if (entryPointOffsets.length && nal.skippedBytes?.length && nal.rbspToEbsp) {
-      const dataStartEbsp = nal.rbspToEbsp[dataStart] ?? dataStart;
-      for (let i = 0; i < entryPointOffsets.length; i++) {
-        const rawOffset = entryPointOffsets[i]!;
-        const rawTarget = dataStartEbsp + rawOffset;
-        let skipped = 0;
-        for (const bytePos of nal.skippedBytes) {
-          if (bytePos >= dataStartEbsp && bytePos <= rawTarget) skipped++;
-        }
-        entryPointOffsets[i] = rawOffset - skipped;
-      }
-    }
+    if (this.debug.trace) this.tr('slice_data_start', dataStart);
+    this.adjustEntryPointOffsets(nal, dataStart, entryPointOffsets);
 
     // ---------- frame setup ----------
     const frame = new DecodedFrame(
@@ -334,7 +377,7 @@ class SliceDecoder {
     this.tileIdMap = new Int32Array(gridW * gridH).fill(-1);
 
     // scaling factors
-    this.scalingFactors = debugEnabled('HEVC_DISABLE_SCALING') ? null : buildScalingFactors(sps, pps);
+    this.scalingFactors = this.debug.disableScaling ? null : buildScalingFactors(sps, pps);
     this.statCoeff.fill(0);
 
     // z-scan table (6.5.2)
@@ -355,12 +398,15 @@ class SliceDecoder {
       }
     }
 
-    const intraCtx = {
+    this.intraCtx = {
       planes: frame.planes, chromaArrayType: this.chromaFormat,
       strongIntraSmoothing: sps.strongIntraSmoothing,
       intraSmoothingDisabled: sps.intraSmoothingDisabled,
       bitDepth: sps.bitDepthLuma,
       minTbAddrZs: this.minTbAddrZs, picWidthInTbs: gridW, log2MinTb: 2,
+      sliceIdMap: this.sliceIdMap, currentSliceId: this.currentSliceId,
+      tileIdMap: this.tileIdMap, currentTileId: this.currentTileId,
+      scratch: this.intraScratch, tuDebug: this.debug.tuDebug,
     };
 
     // tiles
@@ -452,8 +498,8 @@ class SliceDecoder {
       disable: deblockDisable, chromaFormat: this.chromaFormat,
       sliceBorders: null, ctbSizeLog2: sps.log2CtbSize, tileColBd, tileRowBd,
     };
-    if (!deblockDisable && !debugEnabled('HEVC_DISABLE_DEBLOCK')) applyDeblock(frame, dbInfo);
-    if ((saoLuma || saoChroma) && !debugEnabled('HEVC_DISABLE_SAO')) {
+    if (!deblockDisable && !this.debug.disableDeblock) applyDeblock(frame, dbInfo);
+    if ((saoLuma || saoChroma) && !this.debug.disableSao) {
       applySao(frame, saoParams, tileColBd, tileRowBd, ctbCols, ctbRows, sps, saoLuma, saoChroma,
         pps.loopFilterAcrossTiles, sps.pcmLoopFilterDisable ? this.pcmMap : null, this.gridW,
         this.sliceIdMap, lfAcrossSlices);
@@ -479,7 +525,7 @@ class SliceDecoder {
       const numCtb = Math.ceil(sps.width / ctbSize) * Math.ceil(sps.height / ctbSize);
       const addrBits = Math.ceil(Math.log2(numCtb));
       if (addrBits) address = r.u(addrBits);
-      tr('slice_segment_address', address);
+      if (this.debug.trace) this.tr('slice_segment_address', address);
     }
 
     let sliceType = inherited.sliceType;
@@ -580,15 +626,12 @@ class SliceDecoder {
   }
 
   private adjustEntryPointOffsets(nal: HevcNal, dataStart: number, offsets: number[]): void {
-    if (!offsets.length || !nal.skippedBytes?.length || !nal.rbspToEbsp) return;
-    const dataStartEbsp = nal.rbspToEbsp[dataStart] ?? dataStart;
+    if (!offsets.length || !nal.skippedBytes?.length) return;
+    const dataStartEbsp = rbspOffsetToEbsp(dataStart, nal.skippedBytes);
     for (let i = 0; i < offsets.length; i++) {
       const rawOffset = offsets[i]!;
       const rawTarget = dataStartEbsp + rawOffset;
-      let skipped = 0;
-      for (const bytePos of nal.skippedBytes) {
-        if (bytePos >= dataStartEbsp && bytePos <= rawTarget) skipped++;
-      }
+      const skipped = countSkippedBytesInRange(nal.skippedBytes, dataStartEbsp, rawTarget);
       offsets[i] = rawOffset - skipped;
     }
   }
@@ -615,7 +658,7 @@ class SliceDecoder {
     // Independent slice segments initialize contexts; dependent segments carry
     // the preceding segment's contexts but restart the arithmetic engine.
     const inheritedContexts = h.dependent ? this.cabac.saveContexts() : null;
-    this.cabac = new Cabac(h.nal.rbsp, h.dataStart);
+    this.cabac = new Cabac(h.nal.rbsp, h.dataStart, this.debug.cabac);
     if (inheritedContexts) this.cabac.loadContexts(inheritedContexts);
     else this.cabac.initContexts(0, this.sliceQpY);
 
@@ -681,12 +724,12 @@ class SliceDecoder {
     for (let streamIndex = startStream, entry = 0; streamIndex < streams.length; streamIndex++, entry++) {
       const stream = streams[streamIndex]!;
       const start = entry === 0 ? h.dataStart : h.dataStart + (h.entryPointOffsets[entry - 1] ?? 0);
-      this.cabac = new Cabac(h.nal.rbsp, start);
+      this.cabac = new Cabac(h.nal.rbsp, start, this.debug.cabac);
       if (entry === 0 && inheritedContexts) {
         this.cabac.loadContexts(inheritedContexts);
       } else if (h.pps.entropyCodingSync && stream.tileLeft === 0 && stream.rowInTile > 0 && wavefrontContexts.has(stream.tileId)) {
         const sync = wavefrontContexts.get(stream.tileId)!;
-        tr('wpp_load_ctx8', `${sync.states[CTX.PART_MODE]}/${sync.mps[CTX.PART_MODE]}`);
+        if (this.debug.trace) this.tr('wpp_load_ctx8', `${sync.states[CTX.PART_MODE]}/${sync.mps[CTX.PART_MODE]}`);
         this.cabac.loadContexts(sync);
       } else {
         this.cabac.initContexts(0, this.sliceQpY);
@@ -711,7 +754,7 @@ class SliceDecoder {
         this.decodeCtu(x, y, h.sps.log2CtbSize, 0);
         if (h.pps.entropyCodingSync && stream.tileLeft === 0 && pos === first + 1) {
           const sync = this.cabac.saveContexts();
-          tr('wpp_save_ctx8', `${sync.states[CTX.PART_MODE]}/${sync.mps[CTX.PART_MODE]}`);
+          if (this.debug.trace) this.tr('wpp_save_ctx8', `${sync.states[CTX.PART_MODE]}/${sync.mps[CTX.PART_MODE]}`);
           wavefrontContexts.set(stream.tileId, sync);
         }
         if (this.cabac.decodeTerminate() === 1) return;
@@ -725,11 +768,11 @@ class SliceDecoder {
     const sps = this.sps;
     const leftAvail = !atTileLeft && ctbAddr > 0 && params[ctbAddr - 1] !== undefined;
     const upAvail = !atTileTop && ctbAddr >= ctbCols && params[ctbAddr - ctbCols] !== undefined;
-    tr('sao_avail', ctbAddr + ' L' + leftAvail + ' U' + upAvail);
+    if (this.debug.trace) this.tr('sao_avail', ctbAddr + ' L' + leftAvail + ' U' + upAvail);
     let merge = false;
     if (leftAvail) merge = !!cabac.decodeBin(CTX.SAO_MERGE_FLAG);
     if (!merge && upAvail) merge = !!cabac.decodeBin(CTX.SAO_MERGE_FLAG);
-    tr('sao_type_idx', 0);
+    if (this.debug.trace) this.tr('sao_type_idx', 0);
     if (merge && leftAvail) { params[ctbAddr] = params[ctbAddr - 1]!; return; }
     if (merge) { params[ctbAddr] = params[ctbAddr - ctbCols]!; return; }
 
@@ -819,7 +862,7 @@ class SliceDecoder {
       const condL = x0 > 0 && this.sameSliceAt(x0 - 1, y0) && this.ctDepthAt(x0 - 1, y0) > ctDepth ? 1 : 0;
       const condA = y0 > 0 && this.sameSliceAt(x0, y0 - 1) && this.ctDepthAt(x0, y0 - 1) > ctDepth ? 1 : 0;
       split = this.cabac.decodeBin(CTX.SPLIT_CU_FLAG + condL + condA);
-      tr('split_cu_flag', split);
+      if (this.debug.trace) this.tr('split_cu_flag', split);
     } else {
       split = log2Cb > sps.log2MinCbSize ? 1 : 0;
     }
@@ -869,12 +912,12 @@ class SliceDecoder {
     if (log2Cb === sps.log2MinCbSize) {
       const pb = cabac.decodeBin(CTX.PART_MODE);
       partNxN = !pb;
-      tr('part_mode', partNxN ? 'NxN' : '2Nx2N');
+      if (this.debug.trace) this.tr('part_mode', partNxN ? 'NxN' : '2Nx2N');
     }
 
     if (!partNxN && sps.pcmEnabled && log2Cb >= sps.log2MinPcmCbSize && log2Cb <= sps.log2MaxPcmCbSize) {
       const pcmFlag = this.cabac.decodeTerminate();
-      tr('pcm_flag', pcmFlag);
+      if (this.debug.trace) this.tr('pcm_flag', pcmFlag);
       if (pcmFlag) {
         const cuId = this.nextCuId++;
         this.markGrid(this.cuIdMap, x0, y0, nS, cuId);
@@ -886,14 +929,15 @@ class SliceDecoder {
 
     const numPU = partNxN ? 4 : 1;
     const puSize = numPU === 1 ? nS : nS >> 1;
-    const modes: number[] = [];
-    const prevFlags: number[] = [];
+    const modes = this.modeScratch;
+    const prevFlags = this.prevFlagScratch;
     for (let puIdx = 0; puIdx < numPU; puIdx++) {
       const prevFlag = cabac.decodeBin(CTX.PREV_INTRA_LUMA_PRED_FLAG);
-      tr('prev_intra_luma_pred_flag', prevFlag);
-      prevFlags.push(prevFlag);
+      if (this.debug.trace) this.tr('prev_intra_luma_pred_flag', prevFlag);
+      prevFlags[puIdx] = prevFlag;
     }
-    const chromaIdx: number[] = new Array(numPU).fill(4);
+    const chromaIdx = this.chromaIdxScratch;
+    chromaIdx.fill(4, 0, numPU);
     // modes are derived sequentially; each PU's mode is visible to later PUs' MPM candidates
     for (let puIdx = 0; puIdx < numPU; puIdx++) {
       const px = x0 + (puIdx & 1) * puSize;
@@ -904,22 +948,22 @@ class SliceDecoder {
       const candA = this.neighborMode(px, py, -1, 0);
       const atCtbTop = (py & ((1 << sps.log2CtbSize) - 1)) === 0;
       const candB = atCtbTop ? null : this.neighborMode(px, py, 0, -1);
-      tr('cands', px + ',' + py + ' A=' + candA + ' B=' + candB);
-      const cand = fillIntraPredModeCandidates(candA, candB);
+      if (this.debug.trace) this.tr('cands', px + ',' + py + ' A=' + candA + ' B=' + candB);
+      const cand = fillIntraPredModeCandidates(candA, candB, this.candidateModeScratch);
       let mode: number;
       if (prevFlags[puIdx]) {
         let mpm = 0;
         if (cabac.decodeBypass()) { mpm = 1; if (cabac.decodeBypass()) mpm = 2; }
-        tr('mpm_idx', mpm);
+        if (this.debug.trace) this.tr('mpm_idx', mpm);
         mode = intraPredModeDecode(1, mpm, 0, cand);
       } else {
         let rem = 0;
         for (let i = 0; i < 5; i++) rem = (rem << 1) | cabac.decodeBypass();
-        tr('rem_intra_luma_pred_mode', rem);
+        if (this.debug.trace) this.tr('rem_intra_luma_pred_mode', rem);
         mode = intraPredModeDecode(0, 0, rem, cand);
       }
-      tr('mode', mode);
-      modes.push(mode);
+      if (this.debug.trace) this.tr('mode', mode);
+      modes[puIdx] = mode;
       for (let y = 0; y < (puSize >> 2); y++) {
         for (let x = 0; x < (puSize >> 2); x++) {
           this.intraPredMode[((py >> 2) + y) * this.gridW + (px >> 2) + x] = mode;
@@ -930,12 +974,12 @@ class SliceDecoder {
       for (let puIdx = 0; puIdx < numPU; puIdx++) {
         const bChroma = cabac.decodeBin(CTX.INTRA_CHROMA_PRED_MODE);
         chromaIdx[puIdx] = bChroma ? cabac.readFL(2) : 4;
-        tr('intra_chroma_pred_mode', chromaIdx[puIdx]!);
+        if (this.debug.trace) this.tr('intra_chroma_pred_mode', chromaIdx[puIdx]!);
       }
     } else if (this.chromaFormat !== CHROMA_MONO) {
       const bChroma = cabac.decodeBin(CTX.INTRA_CHROMA_PRED_MODE);
-      chromaIdx.fill(bChroma ? cabac.readFL(2) : 4);
-      tr('intra_chroma_pred_mode', chromaIdx[0]!);
+      chromaIdx.fill(bChroma ? cabac.readFL(2) : 4, 0, numPU);
+      if (this.debug.trace) this.tr('intra_chroma_pred_mode', chromaIdx[0]!);
     }
 
     // store chroma-derived modes in 4x4 grid
@@ -956,7 +1000,9 @@ class SliceDecoder {
       }
     }
 
-    tr('CU', x0 + ',' + y0 + ' log' + log2Cb + ' modes' + modes.join('/'));
+    if (this.debug.trace) {
+      this.tr('CU', x0 + ',' + y0 + ' log' + log2Cb + ' modes' + modes.subarray(0, numPU).join('/'));
+    }
     const cuId = this.nextCuId++;
     this.markGrid(this.cuIdMap, x0, y0, nS, cuId);
     this.markGrid(this.tqtBypassMap, x0, y0, nS, this.curTqBypass ? 1 : 0);
@@ -998,7 +1044,7 @@ class SliceDecoder {
       readPlane(2, hS, vS, this.sps.pcmSampleBitDepthChroma, this.sps.bitDepthChroma);
     }
     r.byteAlign();
-    this.cabac = new Cabac(this.rbsp, r.pos >> 3);
+    this.cabac = new Cabac(this.rbsp, r.pos >> 3, this.debug.cabac);
     this.cabac.loadContexts(contexts);
   }
 
@@ -1027,7 +1073,7 @@ class SliceDecoder {
       trafoDepth < maxTrafoDepth && !(intraSplitFlag && trafoDepth === 0)) {
       const ctxInc = 5 - log2TrafoSize;
       split = cabac.decodeBin(CTX.SPLIT_TRANSFORM_FLAG + ctxInc);
-      tr('split_transform_flag', split);
+      if (this.debug.trace) this.tr('split_transform_flag', split);
     } else {
       split = (log2TrafoSize > sps.log2MaxTbSize || (intraSplitFlag && trafoDepth === 0)) ? 1 : 0;
     }
@@ -1038,18 +1084,18 @@ class SliceDecoder {
     if ((log2TrafoSize > 2 && this.chromaFormat !== CHROMA_MONO) || this.chromaFormat === CHROMA_444) {
       if (parentCbfCb) {
         cbfCb = cabac.decodeBin(CTX.CBF_CHROMA + trafoDepth);
-        tr('cbf_cb', cbfCb);
+        if (this.debug.trace) this.tr('cbf_cb', cbfCb);
         if (this.chromaFormat === CHROMA_422 && (!split || log2TrafoSize === 3)) {
           cbfCb |= cabac.decodeBin(CTX.CBF_CHROMA + trafoDepth) << 1;
-          tr('cbf_cb_422', cbfCb >> 1);
+          if (this.debug.trace) this.tr('cbf_cb_422', cbfCb >> 1);
         }
       } else cbfCb = 0;
       if (parentCbfCr) {
         cbfCr = cabac.decodeBin(CTX.CBF_CHROMA + trafoDepth);
-        tr('cbf_cr', cbfCr);
+        if (this.debug.trace) this.tr('cbf_cr', cbfCr);
         if (this.chromaFormat === CHROMA_422 && (!split || log2TrafoSize === 3)) {
           cbfCr |= cabac.decodeBin(CTX.CBF_CHROMA + trafoDepth) << 1;
-          tr('cbf_cr_422', cbfCr >> 1);
+          if (this.debug.trace) this.tr('cbf_cr_422', cbfCr >> 1);
         }
       } else cbfCr = 0;
     }
@@ -1070,7 +1116,7 @@ class SliceDecoder {
     }
 
     const cbfLuma = cabac.decodeBin(CTX.CBF_LUMA + (trafoDepth === 0 ? 1 : 0));
-    tr('cbf_luma', cbfLuma);
+    if (this.debug.trace) this.tr('cbf_luma', cbfLuma);
 
     const tuId = this.nextTuId++;
     this.markGrid(this.tuIdMap, x0, y0, 1 << log2TrafoSize, tuId);
@@ -1116,12 +1162,12 @@ class SliceDecoder {
     this.intraPredDo(x0, y0, log2TrafoSize, 0, modeL);
     this.lumaResidual.fill(0, 0, nT * nT);
     this.lumaResidualStride = nT;
-    if (debugEnabled('HEVC_TU_DEBUG') && x0 === +(debugValue('HEVC_TU_X') ?? 0) && y0 === +(debugValue('HEVC_TU_Y') ?? 0)) {
+    if (this.debug.tuDebug && x0 === this.debug.tuX && y0 === this.debug.tuY) {
       const luma = this.frame.planes[0]!;
       debugWrite(`TUDBG pred Y=${luma.data[y0 * luma.stride + x0]} nT=${nT} mode=${modeL} qp=${this.curQp}\n`);
     }
     if (cbfLuma) this.residualCoding(x0, y0, log2TrafoSize, 0, modeL);
-    if (debugEnabled('HEVC_TU_DEBUG') && x0 === +(debugValue('HEVC_TU_X') ?? 0) && y0 === +(debugValue('HEVC_TU_Y') ?? 0)) {
+    if (this.debug.tuDebug && x0 === this.debug.tuX && y0 === this.debug.tuY) {
       const luma = this.frame.planes[0]!;
       debugWrite(`TUDBG post Y=${luma.data[y0 * luma.stride + x0]}\n`);
     }
@@ -1199,7 +1245,7 @@ class SliceDecoder {
 
   private captureBlock(x0: number, y0: number, nT: number, cIdx: number): Int32Array {
     const plane = this.frame.planes[cIdx]!;
-    const out = new Int32Array(nT * nT);
+    const out = this.crossPrediction;
     for (let y = 0; y < nT; y++) for (let x = 0; x < nT; x++) {
       out[x + y * nT] = plane.data[(y0 + y) * plane.stride + x0 + x]!;
     }
@@ -1207,11 +1253,11 @@ class SliceDecoder {
   }
 
   private applyCrossComponent(x0: number, y0: number, nT: number, cIdx: number, scale: number, prediction: Int32Array): void {
-    if (debugEnabled('HEVC_DISABLE_CROSS_COMPONENT')) return;
+    if (this.debug.disableCrossComponent) return;
     const plane = this.frame.planes[cIdx]!;
     const max = (1 << this.sps.bitDepthChroma) - 1;
-    const debug = debugEnabled('HEVC_TU_DEBUG') && x0 === +(debugValue('HEVC_TU_X') ?? 0) &&
-      y0 === +(debugValue('HEVC_TU_Y') ?? 0) && cIdx === +(debugValue('HEVC_TU_C') ?? 0);
+    const debug = this.debug.tuDebug && x0 === this.debug.tuX &&
+      y0 === this.debug.tuY && cIdx === this.debug.tuComponent;
     for (let y = 0; y < nT; y++) {
       for (let x = 0; x < nT; x++) {
         // H.265 cross-component prediction performs the depth conversion in
@@ -1230,15 +1276,10 @@ class SliceDecoder {
   private intraPredDo(x0: number, y0: number, log2Size: number, cIdx: number, mode: number) {
     const sps = this.sps;
     const bd = cIdx === 0 ? sps.bitDepthLuma : sps.bitDepthChroma;
-    const intraCtx = {
-      planes: this.frame.planes, chromaArrayType: this.chromaFormat,
-      strongIntraSmoothing: sps.strongIntraSmoothing,
-      intraSmoothingDisabled: sps.intraSmoothingDisabled,
-      bitDepth: bd,
-      minTbAddrZs: this.minTbAddrZs, picWidthInTbs: this.tbsW, log2MinTb: 2,
-      sliceIdMap: this.sliceIdMap, currentSliceId: this.currentSliceId,
-      tileIdMap: this.tileIdMap, currentTileId: this.currentTileId,
-    };
+    const intraCtx = this.intraCtx;
+    intraCtx.bitDepth = bd;
+    intraCtx.currentSliceId = this.currentSliceId;
+    intraCtx.currentTileId = this.currentTileId;
     intraPredict(intraCtx, cIdx, x0, y0, mode, 1 << log2Size, false);
   }
 
@@ -1294,7 +1335,7 @@ class SliceDecoder {
         this.qpMap[(cbY0 + y) * this.widthInMinCbs + cbX0 + x] = this.curQp;
       }
     }
-    if (debugEnabled('HEVC_TU_DEBUG') && this.cuQpDeltaCoded) {
+    if (this.debug.tuDebug && this.cuQpDeltaCoded) {
       debugWrite(`QPDBG cu=${cuX},${cuY} qg=${qgX},${qgY} pred=${qpPred} delta=${this.cuQpDelta} qpy=${this.curQp}\n`);
     }
   }
@@ -1302,19 +1343,22 @@ class SliceDecoder {
   private decodeCuQpDeltaAbs(): number {
     const cabac = this.cabac;
     const first = cabac.decodeBin(CTX.CU_QP_DELTA_ABS);
-    tr('qpd_bin0', first);
-    cabac.dump('qpd_after_bin0');
-    if (!first) { tr('cu_qp_delta_abs', 0); return 0; }
+    if (this.debug.trace) this.tr('qpd_bin0', first);
+    if (this.debug.trace) cabac.dump('qpd_after_bin0');
+    if (!first) {
+      if (this.debug.trace) this.tr('cu_qp_delta_abs', 0);
+      return 0;
+    }
     let prefix = 1;
     for (let i = 0; i < 4; i++) {
       const b = cabac.decodeBin(CTX.CU_QP_DELTA_ABS + 1);
-      tr('qpd_bin' + (i + 1), b);
+      if (this.debug.trace) this.tr('qpd_bin' + (i + 1), b);
       if (!b) break;
       prefix++;
     }
-    cabac.dump('qpd_after_prefix');
+    if (this.debug.trace) cabac.dump('qpd_after_prefix');
     const v = prefix === 5 ? cabac.readEGk(0) + 5 : prefix;
-    tr('cu_qp_delta_abs', v);
+    if (this.debug.trace) this.tr('cu_qp_delta_abs', v);
     return v;
   }
 
@@ -1336,8 +1380,23 @@ class SliceDecoder {
   private coeffBuf = new Int32Array(32 * 32);
   private posBuf = new Int32Array(32 * 32);
 
+  private readLastPrefix(base: number, cIdx: number, log2TrafoSize: number, cMax: number): number {
+    let ctxOffset: number, ctxShift: number;
+    if (cIdx === 0) {
+      ctxOffset = 3 * (log2TrafoSize - 2) + ((log2TrafoSize - 1) >> 2);
+      ctxShift = (log2TrafoSize + 1) >> 2;
+    } else {
+      ctxOffset = 15;
+      ctxShift = log2TrafoSize - 2;
+    }
+    for (let binIdx = 0; binIdx < cMax; binIdx++) {
+      if (!this.cabac.decodeBin(base + ctxOffset + (binIdx >> ctxShift))) return binIdx;
+    }
+    return cMax;
+  }
+
   private residualCoding(x0: number, y0: number, log2TrafoSize: number, cIdx: number, intraMode: number) {
-    tr('TU', x0 + ',' + y0 + ' L' + log2TrafoSize + ' c' + cIdx);
+    if (this.debug.trace) this.tr('TU', x0 + ',' + y0 + ' L' + log2TrafoSize + ' c' + cIdx);
     const sps = this.sps;
     const pps = this.pps;
     const cabac = this.cabac;
@@ -1358,24 +1417,10 @@ class SliceDecoder {
       : 0;
 
     const cMax = (log2TrafoSize << 1) - 1;
-    const readLastPrefix = (base: number): number => {
-      let ctxOffset: number, ctxShift: number;
-      if (cIdx === 0) {
-        ctxOffset = 3 * (log2TrafoSize - 2) + ((log2TrafoSize - 1) >> 2);
-        ctxShift = (log2TrafoSize + 1) >> 2;
-      } else {
-        ctxOffset = 15;
-        ctxShift = log2TrafoSize - 2;
-      }
-      for (let binIdx = 0; binIdx < cMax; binIdx++) {
-        if (!cabac.decodeBin(base + ctxOffset + (binIdx >> ctxShift))) return binIdx;
-      }
-      return cMax;
-    };
-    this.cabac.dump('pre_last_sig');
-    const prefixX = readLastPrefix(CTX.LAST_SIG_X_PREFIX);
-    const prefixY = readLastPrefix(CTX.LAST_SIG_Y_PREFIX);
-    tr('last_sig_xy', prefixX + ',' + prefixY);
+    if (this.debug.trace) this.cabac.dump('pre_last_sig');
+    const prefixX = this.readLastPrefix(CTX.LAST_SIG_X_PREFIX, cIdx, log2TrafoSize, cMax);
+    const prefixY = this.readLastPrefix(CTX.LAST_SIG_Y_PREFIX, cIdx, log2TrafoSize, cMax);
+    if (this.debug.trace) this.tr('last_sig_xy', prefixX + ',' + prefixY);
     let lastX: number, lastY: number;
     if (prefixX > 3) {
       const nBits = (prefixX >> 1) - 1;
@@ -1391,8 +1436,10 @@ class SliceDecoder {
     const posScan = SCAN[1]![scanIdx]!;
     const sbW = nT >> 2;
 
-    tr('mode_c', this.modeAtC(x0, y0) + ' at ' + x0 + ',' + y0);
-    tr('tu_info', ('nT' + nT + ' scanIdx' + scanIdx + ' last' + lastX + ',' + lastY + ' mode' + intraMode));
+    if (this.debug.trace) {
+      this.tr('mode_c', this.modeAtC(x0, y0) + ' at ' + x0 + ',' + y0);
+      this.tr('tu_info', 'nT' + nT + ' scanIdx' + scanIdx + ' last' + lastX + ',' + lastY + ' mode' + intraMode);
+    }
     let lastSubBlock: number, lastScanPos: number;
     {
       const sbIdx = sbScan.indexOf((lastX >> 2) + (lastY >> 2) * sbW);
@@ -1401,11 +1448,10 @@ class SliceDecoder {
       lastScanPos = posIdx;
     }
 
-    const csbfNeighbors = new Uint8Array(sbW * sbW);
+    const csbfNeighbors = this.csbfNeighbors;
+    csbfNeighbors.fill(0, 0, sbW * sbW);
     let c1 = 1;
-    let firstSubblock = true;
-    let lastSubblockGreater1Ctx = 0;
-    let lastInvGreater1Ctx = 0, lastInvGreater1Flag = 0, lastInvCtxSet = 0;
+    let lastInvGreater1Ctx = 0, lastInvGreater1Flag = 0;
     let nCoeff = 0;
 
     for (let i = lastSubBlock; i >= 0; i--) {
@@ -1426,9 +1472,9 @@ class SliceDecoder {
         if (sbY > 0) csbfNeighbors[sbX + (sbY - 1) * sbW] |= 2;
       }
 
-      const coeffValue: number[] = [];
-      const coeffScanPos: number[] = [];
-      const coeffMaxBase: number[] = [];
+      const coeffValue = this.subblockCoeffValue;
+      const coeffScanPos = this.subblockCoeffScanPos;
+      const coeffMaxBase = this.subblockCoeffMaxBase;
       let nC = 0;
 
       if (subBlockCoded) {
@@ -1436,7 +1482,7 @@ class SliceDecoder {
         const prevCsbf = csbfNeighbors[sbX + sbY * sbW]!;
         const lastCoeff = i === lastSubBlock ? lastScanPos - 1 : 15;
         if (i === lastSubBlock) {
-          coeffValue.push(1); coeffMaxBase.push(1); coeffScanPos.push(lastScanPos);
+          coeffValue[0] = 1; coeffMaxBase[0] = 1; coeffScanPos[0] = lastScanPos;
           nC = 1;
         }
         for (let n = lastCoeff; n > 0; n--) {
@@ -1448,11 +1494,11 @@ class SliceDecoder {
           } else {
             ctxInc = sigCtxInc(xC, yC, nT, cIdx, scanIdx, prevCsbf);
           }
-          tr('sig_ctx', ctxInc + ' @' + xC + ',' + yC + ' n' + n);
+          if (this.debug.trace) this.tr('sig_ctx', ctxInc + ' @' + xC + ',' + yC + ' n' + n);
           const significant = cabac.decodeBin(CTX.SIGNIFICANT_COEFF_FLAG + ctxInc);
-          tr('significant_coeff_flag', significant);
+          if (this.debug.trace) this.tr('significant_coeff_flag', significant);
           if (significant) {
-            coeffValue.push(1); coeffMaxBase.push(1); coeffScanPos.push(n);
+            coeffValue[nC] = 1; coeffMaxBase[nC] = 1; coeffScanPos[nC] = n;
             nC++;
             inferSbDcSig = 0;
           }
@@ -1466,13 +1512,13 @@ class SliceDecoder {
               ctxInc = sigCtxInc(bx, by, nT, cIdx, scanIdx, prevCsbf);
             }
             const significant = cabac.decodeBin(CTX.SIGNIFICANT_COEFF_FLAG + ctxInc);
-            tr('significant_coeff_flag', significant);
+            if (this.debug.trace) this.tr('significant_coeff_flag', significant);
             if (significant) {
-              coeffValue.push(1); coeffMaxBase.push(1); coeffScanPos.push(0);
+              coeffValue[nC] = 1; coeffMaxBase[nC] = 1; coeffScanPos[nC] = 0;
               nC++;
             }
           } else {
-            coeffValue.push(1); coeffMaxBase.push(1); coeffScanPos.push(0);
+            coeffValue[nC] = 1; coeffMaxBase[nC] = 1; coeffScanPos[nC] = 0;
             nC++;
           }
         }
@@ -1500,12 +1546,11 @@ class SliceDecoder {
           }
           const ctxIdxInc = ctxSet * 4 + Math.min(greater1Ctx, 3) + (cIdx > 0 ? 16 : 0);
           const flag = cabac.decodeBin(CTX.COEFF_ABS_LEVEL_GREATER1 + ctxIdxInc);
-          tr('coeff_abs_level_greater1', flag);
+          if (this.debug.trace) this.tr('coeff_abs_level_greater1', flag);
           lastInvGreater1Ctx = greater1Ctx;
           lastInvGreater1Flag = flag;
-          lastInvCtxSet = ctxSet;
           if (flag) {
-            coeffValue[c]!++;
+            coeffValue[c] = coeffValue[c]! + 1;
             c1 = 0;
             if (newLastGreater1 === -1) newLastGreater1 = c;
           } else {
@@ -1513,23 +1558,20 @@ class SliceDecoder {
             if (c1 > 0 && c1 < 3) c1++;
           }
         }
-        firstSubblock = false;
-        lastSubblockGreater1Ctx = lastInvGreater1Ctx;
-        void lastSubblockGreater1Ctx;
-
         if (newLastGreater1 !== -1) {
-          cabac.dump('pre_g2');
+          if (this.debug.trace) cabac.dump('pre_g2');
           const g2 = cabac.decodeBin(CTX.COEFF_ABS_LEVEL_GREATER2 + ctxSet + (cIdx ? 4 : 0));
-          tr('coeff_abs_level_greater2', g2);
-          cabac.dump('post_g2');
+          if (this.debug.trace) this.tr('coeff_abs_level_greater2', g2);
+          if (this.debug.trace) cabac.dump('post_g2');
           coeffValue[newLastGreater1]! += g2;
           coeffMaxBase[newLastGreater1] = g2;
         }
 
-        cabac.dump('pre_sign');
+        if (this.debug.trace) cabac.dump('pre_sign');
         const signHidden = !this.curTqBypass && rdpcmMode === 0 &&
           (coeffScanPos[0]! - coeffScanPos[nC - 1]! > 3);
-        const signs: number[] = new Array(nC).fill(0);
+        const signs = this.subblockSigns;
+        signs.fill(0, 0, nC);
         for (let n = 0; n < nC - 1; n++) signs[n] = cabac.decodeBypass();
         if (!pps.signDataHiding || !signHidden) signs[nC - 1] = cabac.decodeBypass();
 
@@ -1541,9 +1583,9 @@ class SliceDecoder {
           const base = coeffValue[n]!;
           let remaining = 0;
           if (coeffMaxBase[n]) {
-            cabac.dump('pre_rem');
+            if (this.debug.trace) cabac.dump('pre_rem');
             remaining = this.decodeCoeffAbsLevelRemaining(riceParam);
-            tr('coeff_abs_level_remaining', remaining);
+            if (this.debug.trace) this.tr('coeff_abs_level_remaining', remaining);
             if (base + remaining > 3 * (1 << riceParam)) {
               const maxRice = sps.persistentRiceInit ? 29 : 4;
               if (riceParam < maxRice) riceParam++;
@@ -1597,7 +1639,8 @@ class SliceDecoder {
 
     if (this.curTqBypass) {
       // lossless: transquant bypass
-      const out = new Int16Array(nT * nT);
+      const out = this.transformCoeff;
+      out.fill(0, 0, nT * nT);
       for (let i = 0; i < nCoeff; i++) {
         const pos = rotate ? nT * nT - 1 - this.posBuf[i]! : this.posBuf[i]!;
         out[pos] = this.coeffBuf[i]!;
@@ -1607,38 +1650,41 @@ class SliceDecoder {
       return;
     }
     if (transformSkip) {
-      const coeff = dequant(this.coeffBuf, this.posBuf, nCoeff, nT, qP, bitDepth, sf, rotate);
+      const coeff = dequant(
+        this.coeffBuf, this.posBuf, nCoeff, nT, qP, bitDepth, sf, rotate, this.transformCoeff,
+      );
       this.debugCoefficients(x0, y0, cIdx, coeff, nT);
       addTransformSkip(plane.data, plane.stride, x0, y0, coeff, nT, bitDepth, rdpcmMode, sps.extendedPrecision,
         isLuma ? this.lumaResidual : this.componentResidual);
     } else {
       const useDst = isLuma && nT === 4;
-      const coeff = dequant(this.coeffBuf, this.posBuf, nCoeff, nT, qP, bitDepth, sf, false);
+      const coeff = dequant(
+        this.coeffBuf, this.posBuf, nCoeff, nT, qP, bitDepth, sf, false, this.transformCoeff,
+      );
       this.debugCoefficients(x0, y0, cIdx, coeff, nT);
       addInverseTransform(plane.data, plane.stride, x0, y0, coeff, nT, bitDepth, useDst,
-        isLuma ? this.lumaResidual : this.componentResidual);
+        isLuma ? this.lumaResidual : this.componentResidual, this.transformIntermediate);
     }
   }
 
   private debugCoefficients(x0: number, y0: number, cIdx: number, coeff: Int16Array, nT: number): void {
-    if (!debugEnabled('HEVC_TU_DEBUG') || x0 !== +(debugValue('HEVC_TU_X') ?? 0) ||
-      y0 !== +(debugValue('HEVC_TU_Y') ?? 0) || cIdx !== +(debugValue('HEVC_TU_C') ?? 0)) return;
+    if (!this.debug.tuDebug || x0 !== this.debug.tuX ||
+      y0 !== this.debug.tuY || cIdx !== this.debug.tuComponent) return;
     debugWrite(`COEFFDBG c=${cIdx} nT=${nT}\n`);
     for (let y = 0; y < nT; y++) {
       debugWrite(`${Array.from(coeff.subarray(y * nT, (y + 1) * nT)).join(' ')}\n`);
     }
   }
 
-  private addBypass(data: Uint16Array, stride: number, xT: number, yT: number, coeff: Int16Array, nT: number, bitDepth: number, rdpcmMode = 0, residualOut?: Int32Array) {
+  private addBypass(data: SampleArray, stride: number, xT: number, yT: number, coeff: Int16Array, nT: number, bitDepth: number, rdpcmMode = 0, residualOut?: Int32Array) {
     const maxVal = (1 << bitDepth) - 1;
-    const residual = new Int32Array(nT * nT);
+    const residual = residualOut ?? new Int32Array(nT * nT);
     for (let y = 0; y < nT; y++) {
       for (let x = 0; x < nT; x++) {
         let r = coeff[x + y * nT]!;
         if (rdpcmMode === 1 && x > 0) r += residual[x - 1 + y * nT]!;
         else if (rdpcmMode === 2 && y > 0) r += residual[x + (y - 1) * nT]!;
         residual[x + y * nT] = r;
-        if (residualOut) residualOut[x + y * nT] = r;
         const v = data[(yT + y) * stride + xT + x]! + r;
         data[(yT + y) * stride + xT + x] = v < 0 ? 0 : v > maxVal ? maxVal : v;
       }

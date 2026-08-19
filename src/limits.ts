@@ -14,6 +14,8 @@ export interface DecodeOptions {
   maxExtentsPerItem?: number;
   /** Maximum assembled encoded bytes for one HEIF item. Default: 256 MiB. */
   maxItemBytes?: number;
+  /** Maximum cumulative encoded bytes assembled through item references. Default: 512 MiB. */
+  maxTotalItemBytes?: number;
   /** Maximum boxes in any parsed ISO-BMFF box list. Default: 262,144. */
   maxBoxes?: number;
   /** Maximum recursive derived/auxiliary-item depth. Default: 128. */
@@ -28,6 +30,7 @@ export interface ResolvedDecodeLimits {
   maxProperties: number;
   maxExtentsPerItem: number;
   maxItemBytes: number;
+  maxTotalItemBytes: number;
   maxBoxes: number;
   maxReferenceDepth: number;
 }
@@ -40,6 +43,7 @@ export const DEFAULT_DECODE_LIMITS: Readonly<ResolvedDecodeLimits> = Object.free
   maxProperties: 65_536,
   maxExtentsPerItem: 65_536,
   maxItemBytes: 256 * 1024 * 1024,
+  maxTotalItemBytes: 512 * 1024 * 1024,
   maxBoxes: 262_144,
   maxReferenceDepth: 128,
 });

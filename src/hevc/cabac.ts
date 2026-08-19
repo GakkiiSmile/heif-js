@@ -4,8 +4,25 @@
  */
 import { debugEnabled, debugWrite } from '../debug.ts';
 
+export interface CabacDebugOptions {
+  trace: boolean;
+  operationTrace: boolean;
+  bypassTrace: boolean;
+  stateTrace: boolean;
+}
+
+/** Capture debug flags once before decoding starts; CABAC hot loops never read process.env. */
+export function captureCabacDebugOptions(): CabacDebugOptions {
+  return {
+    trace: debugEnabled('CABAC_TRACE'),
+    operationTrace: debugEnabled('CABAC_OP_TRACE'),
+    bypassTrace: debugEnabled('BYP_TRACE'),
+    stateTrace: debugEnabled('HEVC_TRACE'),
+  };
+}
+
 // rangeTabLps (spec Table 9-44): LPS range by state (rows) and (codIRange>>6)-4
-const LPS_TABLE: readonly (readonly number[])[] = [
+const LPS_TABLE_ROWS: readonly (readonly number[])[] = [
   [128, 176, 208, 240],
   [128, 167, 197, 227],
   [128, 158, 187, 216],
@@ -71,6 +88,7 @@ const LPS_TABLE: readonly (readonly number[])[] = [
   [6, 7, 8, 9],
   [2, 2, 2, 2],
 ];
+const LPS_TABLE = LPS_TABLE_ROWS.flat();
 
 
 const NEXT_MPS = [
@@ -167,10 +185,11 @@ const INIT_SAO_TYPE = [200, 185, 160];
 const INIT_CU_QP_DELTA_ABS = [154, 154];
 const INIT_TRANSFORM_SKIP = [139, 139];
 const INIT_TRANSQUANT_BYPASS = [154, 154, 154];
+const INIT_154 = new Uint8Array(12).fill(154);
 
 function initContexts(ctx: { state: Uint8Array; mps: Uint8Array }, initType: number, qp: number) {
   // `initValues` is an array slice start; count consecutive values are consumed
-  const set = (idx: number, initValues: readonly number[], offset: number, count = 1) => {
+  const set = (idx: number, initValues: ArrayLike<number>, offset: number, count = 1) => {
     for (let i = 0; i < count; i++) {
       const initValue = initValues[offset + i]!;
       const slopeIdx = initValue >> 4, intersecIdx = initValue & 0xF;
@@ -203,11 +222,10 @@ function initContexts(ctx: { state: Uint8Array; mps: Uint8Array }, initType: num
   set(CTX.CU_QP_DELTA_ABS, INIT_CU_QP_DELTA_ABS, 0, 2);
   set(CTX.TRANSFORM_SKIP_FLAG, INIT_TRANSFORM_SKIP, 0, 2);
   set(CTX.CU_TRANSQUANT_BYPASS_FLAG, INIT_TRANSQUANT_BYPASS, initType);
-  const init154 = new Array(12).fill(154);
-  set(CTX.CU_CHROMA_QP_OFFSET_FLAG, init154, 0);
-  set(CTX.CU_CHROMA_QP_OFFSET_IDX, init154, 0);
-  set(CTX.LOG2_RES_SCALE_ABS_PLUS1, init154, 0, 8);
-  set(CTX.RES_SCALE_SIGN_FLAG, init154, 0, 2);
+  set(CTX.CU_CHROMA_QP_OFFSET_FLAG, INIT_154, 0);
+  set(CTX.CU_CHROMA_QP_OFFSET_IDX, INIT_154, 0);
+  set(CTX.LOG2_RES_SCALE_ABS_PLUS1, INIT_154, 0, 8);
+  set(CTX.RES_SCALE_SIGN_FLAG, INIT_154, 0, 2);
 }
 
 export class Cabac {
@@ -218,9 +236,14 @@ export class Cabac {
   private bitPos = 0; // absolute bit position in rbsp
   private bitEnd: number;
   private rbsp: Uint8Array;
+  private debug: CabacDebugOptions;
 
-  constructor(rbsp: Uint8Array, sliceDataStartByte: number) {
+  constructor(
+    rbsp: Uint8Array, sliceDataStartByte: number,
+    debug: CabacDebugOptions = captureCabacDebugOptions(),
+  ) {
     this.rbsp = rbsp;
+    this.debug = debug;
     this.bitPos = sliceDataStartByte * 8;
     this.bitEnd = rbsp.length * 8;
     this.codIOffset = this.readBits(9);
@@ -259,7 +282,7 @@ export class Cabac {
   }
 
   dump(tag: string) {
-    if (debugEnabled('HEVC_TRACE')) {
+    if (this.debug.stateTrace) {
       debugWrite(`[tr] cabac_state ${tag} range=${this.codIRange} offset=${this.codIOffset}\n`);
     }
   }
@@ -267,11 +290,12 @@ export class Cabac {
   decodeBin(ctxIdx: number): number {
     const state = this.states[ctxIdx]!;
     const qIdx = (this.codIRange >> 6) - 4;
-    const rLps = LPS_TABLE[state]![qIdx]!;
+    const rLps = LPS_TABLE[(state << 2) | qIdx]!;
     this.codIRange -= rLps;
     let bit: number;
-    const _rIn = this.codIRange + rLps, _oIn = this.codIOffset;
-    const trace = debugEnabled('CABAC_TRACE');
+    const trace = this.debug.trace;
+    const rIn = trace ? this.codIRange + rLps : 0;
+    const oIn = trace ? this.codIOffset : 0;
     if (this.codIOffset >= this.codIRange) {
       // LPS
       this.codIOffset -= this.codIRange;
@@ -288,8 +312,8 @@ export class Cabac {
       this.codIOffset = ((this.codIOffset << 1) | this.readBit()) & 511;
       this.codIRange <<= 1;
     }
-    if (trace) debugWrite(`[cb] ctx=${ctxIdx} st=${state} q=${qIdx} lps=${rLps} rIn=${_rIn} oIn=${_oIn} bit=${bit} rOut=${this.codIRange} oOut=${this.codIOffset}\n`);
-    if (debugEnabled('CABAC_OP_TRACE')) debugWrite(`OP C ${ctxIdx} ${bit}\n`);
+    if (trace) debugWrite(`[cb] ctx=${ctxIdx} st=${state} q=${qIdx} lps=${rLps} rIn=${rIn} oIn=${oIn} bit=${bit} rOut=${this.codIRange} oOut=${this.codIOffset}\n`);
+    if (this.debug.operationTrace) debugWrite(`OP C ${ctxIdx} ${bit}\n`);
     return bit;
   }
 
@@ -298,12 +322,12 @@ export class Cabac {
     this.codIOffset = (this.codIOffset << 1) | this.readBit();
     if (this.codIOffset >= this.codIRange) {
       this.codIOffset -= this.codIRange;
-      if (debugEnabled('BYP_TRACE')) debugWrite('1');
-      if (debugEnabled('CABAC_OP_TRACE')) debugWrite('OP B 1\n');
+      if (this.debug.bypassTrace) debugWrite('1');
+      if (this.debug.operationTrace) debugWrite('OP B 1\n');
       return 1;
     }
-    if (debugEnabled('BYP_TRACE')) debugWrite('0');
-    if (debugEnabled('CABAC_OP_TRACE')) debugWrite('OP B 0\n');
+    if (this.debug.bypassTrace) debugWrite('0');
+    if (this.debug.operationTrace) debugWrite('OP B 0\n');
     return 0;
   }
 

@@ -3,6 +3,7 @@ import { CHROMA_MONO, CHROMA_420, CHROMA_422 } from './frame.ts';
 import type { DecodedFrame } from './frame.ts';
 
 type Vec3 = readonly [number, number, number];
+type MutableVec3 = [number, number, number];
 type Mat3 = readonly [Vec3, Vec3, Vec3];
 
 const MATRICES: Record<number, readonly [number, number]> = {
@@ -81,7 +82,14 @@ const D50_TO_D65 = chromaticAdaptation(D50, D65);
 const NCLX_TO_SRGB = new Map<number, Mat3>();
 const ICC_TRANSFORMS = new WeakMap<Uint8Array, IccTransform | null>();
 
-type IccTransform = (rgb: Vec3) => Vec3;
+type IccTransform = (red: number, green: number, blue: number, output: MutableVec3) => void;
+
+export interface FrameCrop {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
 
 /** Convert a decoded frame to RGBA8 (row-major, straight alpha). */
 export function frameToRgba(
@@ -93,9 +101,47 @@ export function frameToRgba(
   chromaSamplePosition = 0,
   iccProfile: Uint8Array | null = null,
   colorManagement = true,
+  crop: FrameCrop | null = null,
 ): Uint8ClampedArray {
-  const { width, height, bitDepth, chromaBitDepth, chromaFormat } = frame;
-  const out = new Uint8ClampedArray(width * height * 4);
+  return frameToPixels(
+    frame, matrixCoefficients, fullRange, colourPrimaries, transferCharacteristics,
+    chromaSamplePosition, iccProfile, colorManagement, false, crop,
+  );
+}
+
+/** Convert a decoded frame to the single grayscale channel used by an auxiliary alpha item. */
+export function frameToAlpha(
+  frame: DecodedFrame,
+  matrixCoefficients: number,
+  fullRange: boolean,
+  colourPrimaries = 2,
+  transferCharacteristics = 2,
+  chromaSamplePosition = 0,
+  crop: FrameCrop | null = null,
+): Uint8ClampedArray {
+  return frameToPixels(
+    frame, matrixCoefficients, fullRange, colourPrimaries, transferCharacteristics,
+    chromaSamplePosition, null, false, true, crop,
+  );
+}
+
+function frameToPixels(
+  frame: DecodedFrame,
+  matrixCoefficients: number,
+  fullRange: boolean,
+  colourPrimaries: number,
+  transferCharacteristics: number,
+  chromaSamplePosition: number,
+  iccProfile: Uint8Array | null,
+  colorManagement: boolean,
+  alphaOnly: boolean,
+  crop: FrameCrop | null,
+): Uint8ClampedArray {
+  const { bitDepth, chromaBitDepth, chromaFormat } = frame;
+  const left = crop?.left ?? 0, top = crop?.top ?? 0;
+  const width = crop?.width ?? frame.width, height = crop?.height ?? frame.height;
+  const channels = alphaOnly ? 1 : 4;
+  const out = new Uint8ClampedArray(width * height * channels);
   const maxValue = (1 << bitDepth) - 1;
   const rangeScale = 1 << Math.max(0, bitDepth - 8);
   const yOffset = fullRange ? 0 : 16 * rangeScale;
@@ -112,17 +158,23 @@ export function frameToRgba(
     transferCharacteristics !== 2 && PRIMARIES[colourPrimaries] !== undefined;
 
   if (chromaFormat === CHROMA_MONO) {
+    const rgb: MutableVec3 = [0, 0, 0];
+    let offset = 0;
     for (let y = 0; y < height; y++) {
+      const lumaRow = (top + y) * luma.stride + left;
       for (let x = 0; x < width; x++) {
-        const value = (luma.data[y * luma.stride + x]! - yOffset) / yRange;
-        let rgb: Vec3 = [value, value, value];
-        if (iccTransform) rgb = iccTransform(rgb);
-        else if (manageNclx) rgb = convertNclxToSrgb(rgb, colourPrimaries, transferCharacteristics);
-        const offset = (y * width + x) * 4;
-        out[offset] = rgb[0] * 255;
-        out[offset + 1] = rgb[1] * 255;
-        out[offset + 2] = rgb[2] * 255;
-        out[offset + 3] = 255;
+        const value = (luma.data[lumaRow + x]! - yOffset) / yRange;
+        rgb[0] = rgb[1] = rgb[2] = value;
+        if (iccTransform) iccTransform(rgb[0], rgb[1], rgb[2], rgb);
+        else if (manageNclx) {
+          convertNclxToSrgbInto(rgb[0], rgb[1], rgb[2], colourPrimaries, transferCharacteristics, rgb);
+        }
+        out[offset++] = rgb[0] * 255;
+        if (!alphaOnly) {
+          out[offset++] = rgb[1] * 255;
+          out[offset++] = rgb[2] * 255;
+          out[offset++] = 255;
+        }
       }
     }
     return out;
@@ -135,60 +187,157 @@ export function frameToRgba(
     ? derivedKrKb(colourPrimaries)
     : MATRICES[matrixCoefficients] ?? MATRICES[2]!;
 
+  if (bitDepth === 8 && chromaBitDepth === 8 && !iccTransform && !manageNclx &&
+      matrixCoefficients !== 0 && matrixCoefficients !== 8 && matrixCoefficients !== 10 &&
+      matrixCoefficients !== 11 && matrixCoefficients !== 13 && matrixCoefficients !== 14 &&
+      matrixCoefficients !== 15) {
+    writeStandard8(
+      out, frame, left, top, width, height, alphaOnly, fullRange, coefficients,
+      horizontalShift, verticalShift, chromaSamplePosition,
+    );
+    return out;
+  }
+
+  const rgb: MutableVec3 = [0, 0, 0];
+  const chroma: [number, number] = [0, 0];
+  let offset = 0;
   for (let y = 0; y < height; y++) {
+    const sourceY = top + y;
+    const lumaRow = sourceY * luma.stride + left;
     for (let x = 0; x < width; x++) {
-      const yCode = luma.data[y * luma.stride + x]!;
-      const cbCode = sampleChroma(cb, x, y, horizontalShift, verticalShift, chromaSamplePosition);
-      const crCode = sampleChroma(cr, x, y, horizontalShift, verticalShift, chromaSamplePosition);
-      let rgb: Vec3;
+      const sourceX = left + x;
+      const yCode = luma.data[lumaRow + x]!;
+      sampleChromaPair(cb, cr, sourceX, sourceY, horizontalShift, verticalShift, chromaSamplePosition, chroma);
+      const cbCode = chroma[0], crCode = chroma[1];
 
       if (matrixCoefficients === 0) {
         // H.273 identity carries planes in G, B, R order. Unlike YCbCr,
         // limited-range identity applies the luma offset/range to all planes.
-        rgb = [
-          (crCode - componentOffset) / componentRange,
-          (yCode - yOffset) / yRange,
-          (cbCode - componentOffset) / componentRange,
-        ];
+        rgb[0] = (crCode - componentOffset) / componentRange;
+        rgb[1] = (yCode - yOffset) / yRange;
+        rgb[2] = (cbCode - componentOffset) / componentRange;
       } else if (matrixCoefficients === 8) {
         // Integer YCgCo inverse (H.273 equations 54-57).
         const cg = cbCode - chromaMid, co = crCode - chromaMid;
         const temporary = yCode - cg;
-        rgb = [
-          (temporary + co - yOffset) / yRange,
-          (yCode + cg - yOffset) / yRange,
-          (temporary - co - yOffset) / yRange,
-        ];
+        rgb[0] = (temporary + co - yOffset) / yRange;
+        rgb[1] = (yCode + cg - yOffset) / yRange;
+        rgb[2] = (temporary - co - yOffset) / yRange;
       } else {
         const yPrime = (yCode - yOffset) / yRange;
         const pb = (cbCode - chromaMid) / chromaRange;
         const pr = (crCode - chromaMid) / chromaRange;
-        rgb = inverseMatrix(
+        inverseMatrixInto(
           yPrime, pb, pr, matrixCoefficients, coefficients,
-          transferCharacteristics,
+          transferCharacteristics, rgb,
         );
       }
 
-      if (iccTransform) rgb = iccTransform(rgb);
-      else if (manageNclx) rgb = convertNclxToSrgb(rgb, colourPrimaries, transferCharacteristics);
+      if (iccTransform) iccTransform(rgb[0], rgb[1], rgb[2], rgb);
+      else if (manageNclx) {
+        convertNclxToSrgbInto(rgb[0], rgb[1], rgb[2], colourPrimaries, transferCharacteristics, rgb);
+      }
 
-      const offset = (y * width + x) * 4;
-      out[offset] = rgb[0] * 255;
-      out[offset + 1] = rgb[1] * 255;
-      out[offset + 2] = rgb[2] * 255;
-      out[offset + 3] = 255;
+      out[offset++] = rgb[0] * 255;
+      if (!alphaOnly) {
+        out[offset++] = rgb[1] * 255;
+        out[offset++] = rgb[2] * 255;
+        out[offset++] = 255;
+      }
     }
   }
   return out;
 }
 
-function sampleChroma(
-  plane: DecodedFrame['luma'], x: number, y: number,
+function writeStandard8(
+  out: Uint8ClampedArray, frame: DecodedFrame,
+  left: number, top: number, width: number, height: number, alphaOnly: boolean,
+  fullRange: boolean, coefficients: readonly [number, number],
   horizontalShift: number, verticalShift: number, chromaSamplePosition: number,
-): number {
-  if (!horizontalShift && !verticalShift) return plane.data[y * plane.stride + x]!;
+): void {
+  const luma = frame.luma, cb = frame.cb, cr = frame.cr;
+  const yOffset = fullRange ? 0 : 16, yRange = fullRange ? 255 : 219;
+  const chromaRange = fullRange ? 255 : 224;
+  const [kr, kb] = coefficients, kg = 1 - kr - kb;
+  const redScale = 2 * (1 - kr), blueScale = 2 * (1 - kb);
+  const greenRedScale = 2 * kr * (1 - kr) / kg;
+  const greenBlueScale = 2 * kb * (1 - kb) / kg;
+  const direct = (!horizontalShift && !verticalShift) || chromaSamplePosition === 0;
+  const x0s = direct ? null : new Uint32Array(width);
+  const x1s = direct ? null : new Uint32Array(width);
+  const fractionsX = direct ? null : new Float64Array(width);
+  if (!direct) {
+    const horizontallyCentered = chromaSamplePosition === 3 || chromaSamplePosition === 4;
+    for (let x = 0; x < width; x++) {
+      const sourceX = horizontallyCentered ? (left + x) / 2 - 0.25 : (left + x) / 2;
+      const floorX = Math.floor(sourceX);
+      const x0 = Math.max(0, Math.min(cb.width - 1, floorX));
+      x0s![x] = x0;
+      x1s![x] = Math.max(0, Math.min(cb.width - 1, x0 + 1));
+      fractionsX![x] = Math.max(0, Math.min(1, sourceX - floorX));
+    }
+  }
+  let offset = 0;
+  for (let y = 0; y < height; y++) {
+    const sourceY = top + y;
+    const lumaRow = sourceY * luma.stride + left;
+    const directChromaRow = (sourceY >> verticalShift) * cb.stride;
+    let chromaRow0 = 0, chromaRow1 = 0, fractionY = 0;
+    if (!direct) {
+      const interpolatedY = verticalShift
+        ? (chromaSamplePosition === 2 || chromaSamplePosition === 4 ? sourceY / 2 : sourceY / 2 - 0.25)
+        : sourceY;
+      const floorY = Math.floor(interpolatedY);
+      const y0 = Math.max(0, Math.min(cb.height - 1, floorY));
+      const y1 = Math.max(0, Math.min(cb.height - 1, y0 + 1));
+      chromaRow0 = y0 * cb.stride;
+      chromaRow1 = y1 * cb.stride;
+      fractionY = Math.max(0, Math.min(1, interpolatedY - floorY));
+    }
+    for (let x = 0; x < width; x++) {
+      const sourceX = left + x;
+      let cbCode: number, crCode: number;
+      if (direct) {
+        const chromaIndex = directChromaRow + (sourceX >> horizontalShift);
+        cbCode = cb.data[chromaIndex]!;
+        crCode = cr.data[chromaIndex]!;
+      } else {
+        const x0 = x0s![x]!, x1 = x1s![x]!, fractionX = fractionsX![x]!;
+        const inverseX = 1 - fractionX, inverseY = 1 - fractionY;
+        const cbTop = cb.data[chromaRow0 + x0]! * inverseX + cb.data[chromaRow0 + x1]! * fractionX;
+        const cbBottom = cb.data[chromaRow1 + x0]! * inverseX + cb.data[chromaRow1 + x1]! * fractionX;
+        const crTop = cr.data[chromaRow0 + x0]! * inverseX + cr.data[chromaRow0 + x1]! * fractionX;
+        const crBottom = cr.data[chromaRow1 + x0]! * inverseX + cr.data[chromaRow1 + x1]! * fractionX;
+        cbCode = cbTop * inverseY + cbBottom * fractionY;
+        crCode = crTop * inverseY + crBottom * fractionY;
+      }
+      const yPrime = (luma.data[lumaRow + x]! - yOffset) / yRange;
+      const pb = (cbCode - 128) / chromaRange;
+      const pr = (crCode - 128) / chromaRange;
+      out[offset++] = (yPrime + redScale * pr) * 255;
+      if (!alphaOnly) {
+        out[offset++] = (yPrime - greenRedScale * pr - greenBlueScale * pb) * 255;
+        out[offset++] = (yPrime + blueScale * pb) * 255;
+        out[offset++] = 255;
+      }
+    }
+  }
+}
+
+function sampleChromaPair(
+  cb: DecodedFrame['luma'], cr: DecodedFrame['luma'], x: number, y: number,
+  horizontalShift: number, verticalShift: number, chromaSamplePosition: number,
+  output: [number, number],
+): void {
+  if (!horizontalShift && !verticalShift) {
+    const index = y * cb.stride + x;
+    output[0] = cb.data[index]!; output[1] = cr.data[index]!;
+    return;
+  }
   if (chromaSamplePosition === 0) {
-    return plane.data[(y >> verticalShift) * plane.stride + (x >> horizontalShift)]!;
+    const index = (y >> verticalShift) * cb.stride + (x >> horizontalShift);
+    output[0] = cb.data[index]!; output[1] = cr.data[index]!;
+    return;
   }
   // AV1's signaled positions are horizontally co-sited; the conventional
   // fallback for CSP_UNKNOWN and the fixed 4:2:2 layout use the same siting.
@@ -196,70 +345,70 @@ function sampleChroma(
   const sourceX = horizontalShift ? (horizontallyCentered ? x / 2 - 0.25 : x / 2) : x;
   const sourceY = verticalShift ?
     (chromaSamplePosition === 2 || chromaSamplePosition === 4 ? y / 2 : y / 2 - 0.25) : y;
-  const x0 = Math.max(0, Math.min(plane.width - 1, Math.floor(sourceX)));
-  const y0 = Math.max(0, Math.min(plane.height - 1, Math.floor(sourceY)));
-  const x1 = Math.max(0, Math.min(plane.width - 1, x0 + 1));
-  const y1 = Math.max(0, Math.min(plane.height - 1, y0 + 1));
-  const fractionX = Math.max(0, Math.min(1, sourceX - Math.floor(sourceX)));
-  const fractionY = Math.max(0, Math.min(1, sourceY - Math.floor(sourceY)));
-  const top = plane.data[y0 * plane.stride + x0]! * (1 - fractionX) +
-    plane.data[y0 * plane.stride + x1]! * fractionX;
-  const bottom = plane.data[y1 * plane.stride + x0]! * (1 - fractionX) +
-    plane.data[y1 * plane.stride + x1]! * fractionX;
-  return top * (1 - fractionY) + bottom * fractionY;
+  const floorX = Math.floor(sourceX), floorY = Math.floor(sourceY);
+  const x0 = Math.max(0, Math.min(cb.width - 1, floorX));
+  const y0 = Math.max(0, Math.min(cb.height - 1, floorY));
+  const x1 = Math.max(0, Math.min(cb.width - 1, x0 + 1));
+  const y1 = Math.max(0, Math.min(cb.height - 1, y0 + 1));
+  const fractionX = Math.max(0, Math.min(1, sourceX - floorX));
+  const fractionY = Math.max(0, Math.min(1, sourceY - floorY));
+  const row0 = y0 * cb.stride, row1 = y1 * cb.stride;
+  const inverseX = 1 - fractionX, inverseY = 1 - fractionY;
+  const cbTop = cb.data[row0 + x0]! * inverseX + cb.data[row0 + x1]! * fractionX;
+  const cbBottom = cb.data[row1 + x0]! * inverseX + cb.data[row1 + x1]! * fractionX;
+  const crTop = cr.data[row0 + x0]! * inverseX + cr.data[row0 + x1]! * fractionX;
+  const crBottom = cr.data[row1 + x0]! * inverseX + cr.data[row1 + x1]! * fractionX;
+  output[0] = cbTop * inverseY + cbBottom * fractionY;
+  output[1] = crTop * inverseY + crBottom * fractionY;
 }
 
-function inverseMatrix(
+function inverseMatrixInto(
   y: number, pb: number, pr: number,
   matrix: number, coefficients: readonly [number, number], transfer: number,
-): Vec3 {
+  output: MutableVec3,
+): void {
   if (matrix === 10 || matrix === 13) {
-    return inverseConstantLuminance(y, pb, pr, coefficients, transfer, matrix);
+    inverseConstantLuminanceInto(y, pb, pr, coefficients, transfer, matrix, output);
+    return;
   }
   if (matrix === 11) {
-    return [2 * pr + 0.991902 * y, y, (2 * pb + y) / 0.986566];
+    output[0] = 2 * pr + 0.991902 * y;
+    output[1] = y;
+    output[2] = (2 * pb + y) / 0.986566;
+    return;
   }
   if (matrix === 14) {
-    const encodedLms = multiply3(transfer === 18 ? ICTCP_HLG_TO_LMS : ICTCP_PQ_TO_LMS, [y, pb, pr]);
-    const linearLms: Vec3 = [
-      inverseTransfer(encodedLms[0], transfer, matrix),
-      inverseTransfer(encodedLms[1], transfer, matrix),
-      inverseTransfer(encodedLms[2], transfer, matrix),
-    ];
-    const linearRgb = multiply3(LMS_ICTCP_TO_RGB, linearLms);
-    return [
-      forwardTransfer(linearRgb[0], transfer, matrix),
-      forwardTransfer(linearRgb[1], transfer, matrix),
-      forwardTransfer(linearRgb[2], transfer, matrix),
-    ];
+    const encoded = transfer === 18 ? ICTCP_HLG_TO_LMS : ICTCP_PQ_TO_LMS;
+    const l0 = inverseTransfer(encoded[0][0] * y + encoded[0][1] * pb + encoded[0][2] * pr, transfer, matrix);
+    const l1 = inverseTransfer(encoded[1][0] * y + encoded[1][1] * pb + encoded[1][2] * pr, transfer, matrix);
+    const l2 = inverseTransfer(encoded[2][0] * y + encoded[2][1] * pb + encoded[2][2] * pr, transfer, matrix);
+    output[0] = forwardTransfer(LMS_ICTCP_TO_RGB[0][0] * l0 + LMS_ICTCP_TO_RGB[0][1] * l1 + LMS_ICTCP_TO_RGB[0][2] * l2, transfer, matrix);
+    output[1] = forwardTransfer(LMS_ICTCP_TO_RGB[1][0] * l0 + LMS_ICTCP_TO_RGB[1][1] * l1 + LMS_ICTCP_TO_RGB[1][2] * l2, transfer, matrix);
+    output[2] = forwardTransfer(LMS_ICTCP_TO_RGB[2][0] * l0 + LMS_ICTCP_TO_RGB[2][1] * l1 + LMS_ICTCP_TO_RGB[2][2] * l2, transfer, matrix);
+    return;
   }
   if (matrix === 15) {
-    const encodedLms = multiply3(IPT_TO_LMS, [y, pb, pr]);
-    const linearLms: Vec3 = [
-      inverseTransfer(encodedLms[0], transfer, matrix),
-      inverseTransfer(encodedLms[1], transfer, matrix),
-      inverseTransfer(encodedLms[2], transfer, matrix),
-    ];
-    const linearRgb = multiply3(LMS_IPT_TO_RGB, linearLms);
-    return [
-      forwardTransfer(linearRgb[0], transfer, matrix),
-      forwardTransfer(linearRgb[1], transfer, matrix),
-      forwardTransfer(linearRgb[2], transfer, matrix),
-    ];
+    const l0 = inverseTransfer(IPT_TO_LMS[0][0] * y + IPT_TO_LMS[0][1] * pb + IPT_TO_LMS[0][2] * pr, transfer, matrix);
+    const l1 = inverseTransfer(IPT_TO_LMS[1][0] * y + IPT_TO_LMS[1][1] * pb + IPT_TO_LMS[1][2] * pr, transfer, matrix);
+    const l2 = inverseTransfer(IPT_TO_LMS[2][0] * y + IPT_TO_LMS[2][1] * pb + IPT_TO_LMS[2][2] * pr, transfer, matrix);
+    output[0] = forwardTransfer(LMS_IPT_TO_RGB[0][0] * l0 + LMS_IPT_TO_RGB[0][1] * l1 + LMS_IPT_TO_RGB[0][2] * l2, transfer, matrix);
+    output[1] = forwardTransfer(LMS_IPT_TO_RGB[1][0] * l0 + LMS_IPT_TO_RGB[1][1] * l1 + LMS_IPT_TO_RGB[1][2] * l2, transfer, matrix);
+    output[2] = forwardTransfer(LMS_IPT_TO_RGB[2][0] * l0 + LMS_IPT_TO_RGB[2][1] * l1 + LMS_IPT_TO_RGB[2][2] * l2, transfer, matrix);
+    return;
   }
 
   const [kr, kb] = coefficients;
   const kg = 1 - kr - kb;
-  const r = y + 2 * (1 - kr) * pr;
-  const b = y + 2 * (1 - kb) * pb;
-  const g = y - 2 * kr * (1 - kr) / kg * pr - 2 * kb * (1 - kb) / kg * pb;
-  return [r, g, b];
+  output[0] = y + 2 * (1 - kr) * pr;
+  output[2] = y + 2 * (1 - kb) * pb;
+  output[1] = y - 2 * kr * (1 - kr) / kg * pr - 2 * kb * (1 - kb) / kg * pb;
 }
 
-function inverseConstantLuminance(
+function inverseConstantLuminanceInto(
   yPrime: number, pb: number, pr: number,
   coefficients: readonly [number, number], transfer: number, matrix: number,
-): Vec3 {
+  output: MutableVec3,
+): void {
   const [kr, kb] = coefficients;
   const kg = 1 - kr - kb;
   const negativeB = forwardTransfer(1 - kb, transfer, matrix);
@@ -272,7 +421,9 @@ function inverseConstantLuminance(
   const linearB = inverseTransfer(bPrime, transfer, matrix);
   const linearR = inverseTransfer(rPrime, transfer, matrix);
   const linearG = (linearY - kr * linearR - kb * linearB) / kg;
-  return [rPrime, forwardTransfer(linearG, transfer, matrix), bPrime];
+  output[0] = rPrime;
+  output[1] = forwardTransfer(linearG, transfer, matrix);
+  output[2] = bPrime;
 }
 
 function derivedKrKb(primariesCode: number): readonly [number, number] {
@@ -403,15 +554,22 @@ function multiply3(matrix: Mat3, vector: Vec3): Vec3 {
   ];
 }
 
-function convertNclxToSrgb(rgb: Vec3, primariesCode: number, transfer: number): Vec3 {
-  if (primariesCode === 1 && transfer === 13) return rgb;
+function convertNclxToSrgbInto(
+  red: number, green: number, blue: number,
+  primariesCode: number, transfer: number, output: MutableVec3,
+): void {
+  if (primariesCode === 1 && transfer === 13) {
+    output[0] = red; output[1] = green; output[2] = blue;
+    return;
+  }
   const sourcePrimaries = PRIMARIES[primariesCode];
-  if (!sourcePrimaries || !isKnownTransfer(transfer)) return rgb;
-  const linearSource: Vec3 = [
-    inverseTransfer(rgb[0], transfer, 0),
-    inverseTransfer(rgb[1], transfer, 0),
-    inverseTransfer(rgb[2], transfer, 0),
-  ];
+  if (!sourcePrimaries || !isKnownTransfer(transfer)) {
+    output[0] = red; output[1] = green; output[2] = blue;
+    return;
+  }
+  const linearRed = inverseTransfer(red, transfer, 0);
+  const linearGreen = inverseTransfer(green, transfer, 0);
+  const linearBlue = inverseTransfer(blue, transfer, 0);
   let conversion = NCLX_TO_SRGB.get(primariesCode);
   if (!conversion) {
     conversion = multiplyMatrices(
@@ -420,37 +578,30 @@ function convertNclxToSrgb(rgb: Vec3, primariesCode: number, transfer: number): 
     );
     NCLX_TO_SRGB.set(primariesCode, conversion);
   }
-  let linear = multiply3(conversion, linearSource);
-  if (transfer === 16) linear = toneMapPq(linear);
-  else if (transfer === 18) linear = applyHlgOotf(linear);
-  return [
-    forwardTransfer(linear[0], 13, 1),
-    forwardTransfer(linear[1], 13, 1),
-    forwardTransfer(linear[2], 13, 1),
-  ];
+  let convertedRed = conversion[0][0] * linearRed + conversion[0][1] * linearGreen + conversion[0][2] * linearBlue;
+  let convertedGreen = conversion[1][0] * linearRed + conversion[1][1] * linearGreen + conversion[1][2] * linearBlue;
+  let convertedBlue = conversion[2][0] * linearRed + conversion[2][1] * linearGreen + conversion[2][2] * linearBlue;
+  if (transfer === 16) {
+    const scale = 10_000 / 203;
+    convertedRed *= scale; convertedGreen *= scale; convertedBlue *= scale;
+    const luminance = Math.max(0, 0.2126 * convertedRed + 0.7152 * convertedGreen + 0.0722 * convertedBlue);
+    if (luminance > 1e-12) {
+      const mapped = luminance * (1 + luminance / (scale * scale)) / (1 + luminance);
+      const factor = mapped / luminance;
+      convertedRed *= factor; convertedGreen *= factor; convertedBlue *= factor;
+    }
+  } else if (transfer === 18) {
+    const luminance = Math.max(1e-12, 0.2627 * convertedRed + 0.6780 * convertedGreen + 0.0593 * convertedBlue);
+    const factor = luminance ** 0.2;
+    convertedRed *= factor; convertedGreen *= factor; convertedBlue *= factor;
+  }
+  output[0] = forwardTransfer(convertedRed, 13, 1);
+  output[1] = forwardTransfer(convertedGreen, 13, 1);
+  output[2] = forwardTransfer(convertedBlue, 13, 1);
 }
 
 function isKnownTransfer(transfer: number): boolean {
   return transfer === 1 || transfer >= 4 && transfer <= 18;
-}
-
-function toneMapPq(rgb: Vec3): Vec3 {
-  // ST 2084 is normalized to 10,000 cd/m². Map it to an SDR diffuse-white
-  // target (203 cd/m²), preserving hue by scaling all channels by luminance.
-  const scale = 10_000 / 203;
-  const linear: Vec3 = [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale];
-  const luminance = Math.max(0, 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]);
-  if (luminance <= 1e-12) return linear;
-  const white = scale;
-  const mapped = luminance * (1 + luminance / (white * white)) / (1 + luminance);
-  const factor = mapped / luminance;
-  return [linear[0] * factor, linear[1] * factor, linear[2] * factor];
-}
-
-function applyHlgOotf(rgb: Vec3): Vec3 {
-  const luminance = Math.max(1e-12, 0.2627 * rgb[0] + 0.6780 * rgb[1] + 0.0593 * rgb[2]);
-  const factor = luminance ** 0.2; // nominal 1,000 cd/m² display gamma 1.2
-  return [rgb[0] * factor, rgb[1] * factor, rgb[2] * factor];
 }
 
 function rgbToXyzMatrix(primaries: Chromaticities): Mat3 {
@@ -539,13 +690,17 @@ function parseMatrixIccProfile(profile: Uint8Array): IccTransform | null {
     [rXyz[2], gXyz[2], bXyz[2]],
   ];
   const sourceToSrgb = multiplyMatrices(XYZ_D65_TO_SRGB, multiplyMatrices(D50_TO_D65, sourceToD50));
-  return (rgb: Vec3): Vec3 => {
-    const linear = multiply3(sourceToSrgb, [rTrc(rgb[0]), gTrc(rgb[1]), bTrc(rgb[2])]);
-    return [
-      forwardTransfer(linear[0], 13, 1),
-      forwardTransfer(linear[1], 13, 1),
-      forwardTransfer(linear[2], 13, 1),
-    ];
+  return (red: number, green: number, blue: number, output: MutableVec3): void => {
+    const linearRed = rTrc(red), linearGreen = gTrc(green), linearBlue = bTrc(blue);
+    output[0] = forwardTransfer(
+      sourceToSrgb[0][0] * linearRed + sourceToSrgb[0][1] * linearGreen + sourceToSrgb[0][2] * linearBlue, 13, 1,
+    );
+    output[1] = forwardTransfer(
+      sourceToSrgb[1][0] * linearRed + sourceToSrgb[1][1] * linearGreen + sourceToSrgb[1][2] * linearBlue, 13, 1,
+    );
+    output[2] = forwardTransfer(
+      sourceToSrgb[2][0] * linearRed + sourceToSrgb[2][1] * linearGreen + sourceToSrgb[2][2] * linearBlue, 13, 1,
+    );
   };
 }
 

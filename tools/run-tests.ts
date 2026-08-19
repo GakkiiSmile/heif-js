@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { decodeToRgba, DecodeError, detectFormat } from '../src/index.ts';
+import { decodeToImageData, decodeToRgba, DecodeError, detectFormat } from '../src/index.ts';
+import { decodeToRgba as decodeHeicToRgba } from '../src/heic.ts';
+import { decodeToRgba as decodeAvifToRgba } from '../src/avif.ts';
+import { decodeToRgbaAsync } from '../src/async.ts';
 import { HeifFile } from '../src/bmff.ts';
 import { Av1Decoder } from '../src/av1/decode.ts';
 import { decodePng } from './png.ts';
-import { DecodedFrame, CHROMA_444 } from '../src/frame.ts';
-import { frameToRgba } from '../src/color.ts';
+import { DecodedFrame, CHROMA_420, CHROMA_444 } from '../src/frame.ts';
+import { frameToAlpha, frameToRgba } from '../src/color.ts';
 import { HevcDecoder } from '../src/hevc/decode.ts';
-import { nalsFromLengthPrefixed, parseHvcC } from '../src/hevc/nal.ts';
+import {
+  countSkippedBytesInRange, nalsFromAnnexB, nalsFromLengthPrefixed, parseHvcC, rbspOffsetToEbsp,
+} from '../src/hevc/nal.ts';
 
 const heicCases = [
   ['a', 320, 240],
@@ -23,6 +28,7 @@ for (const [name, width, height] of heicCases) {
   const padded = new Uint8Array(encoded.length + 7);
   padded.set(encoded, 3);
   const decoded = decodeToRgba(padded.subarray(3, 3 + encoded.length));
+  assert.deepEqual(Object.keys(decoded), ['width', 'height', 'data']);
   assert.equal(decoded.width, width);
   assert.equal(decoded.height, height);
   assert.equal(decoded.data.length, width * height * 4);
@@ -32,6 +38,124 @@ for (const [name, width, height] of heicCases) {
   const psnr = rgbPsnr(decoded.data, reference.rgba);
   assert.ok(psnr > 22, `HEIC ${name} RGB PSNR is too low: ${psnr.toFixed(2)} dB`);
   console.log(`ok HEIC ${name}: ${width}x${height}, RGB PSNR ${psnr.toFixed(2)} dB`);
+}
+
+const zeroCopyBytes = new Uint8Array(readFileSync('testimages/heic_a.heic'));
+const zeroCopyFile = new HeifFile().parse(zeroCopyBytes);
+const zeroCopyData = zeroCopyFile.primary.data;
+assert.equal(zeroCopyData.buffer, zeroCopyBytes.buffer);
+assert.ok(zeroCopyData.byteOffset >= zeroCopyBytes.byteOffset);
+assert.ok(zeroCopyData.byteOffset + zeroCopyData.byteLength <= zeroCopyBytes.byteOffset + zeroCopyBytes.byteLength);
+console.log('ok HEIF single-extent item data remains a zero-copy input view');
+
+const reusableFile = new HeifFile();
+const retainedInput = new Uint8Array(readFileSync('testimages/heic_a.heic'));
+const retainedItem = reusableFile.parse(retainedInput).primary;
+reusableFile.parse(new Uint8Array(readFileSync('testimages/heic_b.heic')));
+const retainedData = retainedItem.data;
+const retainedExpected = new HeifFile().parse(retainedInput).primary.data;
+assert.equal(retainedData.buffer, retainedInput.buffer);
+assert.deepEqual(retainedData, retainedExpected);
+console.log('ok HEIF lazy item data survives HeifFile parser reuse');
+
+if (typeof SharedArrayBuffer !== 'undefined') {
+  const source = new Uint8Array(readFileSync('testimages/heic_b.heic'));
+  const expectedFile = new HeifFile().parse(source);
+  const expectedMetadata = [expectedFile.primary.type, expectedFile.primary.width, expectedFile.primary.height] as const;
+  const expectedData = new Uint8Array(expectedFile.primary.data);
+  const shared = new SharedArrayBuffer(source.length + 9);
+  const sharedView = new Uint8Array(shared, 5, source.length);
+  sharedView.set(source);
+  const sharedFile = new HeifFile().parse(sharedView);
+  const retainedSharedItem = sharedFile.primary;
+  sharedView.fill(0);
+  assert.deepEqual(
+    [retainedSharedItem.type, retainedSharedItem.width, retainedSharedItem.height],
+    expectedMetadata,
+  );
+  assert.deepEqual(retainedSharedItem.data, expectedData);
+  assert.ok(retainedSharedItem.data.buffer instanceof ArrayBuffer);
+
+  const decodeShared = new SharedArrayBuffer(source.length + 7);
+  const decodeSharedView = new Uint8Array(decodeShared, 3, source.length);
+  decodeSharedView.set(source);
+  assert.deepEqual(decodeToRgba(decodeSharedView), decodeToRgba(source));
+  console.log('ok SharedArrayBuffer input is snapshotted for parsing, lazy data, and decode');
+}
+
+const originalImageData = globalThis.ImageData;
+let capturedImageDataPixels: Uint8ClampedArray<ArrayBuffer> | undefined;
+class FakeImageData {
+  readonly data: Uint8ClampedArray<ArrayBuffer>;
+  readonly width: number;
+  readonly height: number;
+  constructor(
+    data: Uint8ClampedArray<ArrayBuffer>,
+    width: number,
+    height: number,
+  ) {
+    this.data = data;
+    this.width = width;
+    this.height = height;
+    capturedImageDataPixels = data;
+  }
+}
+Object.defineProperty(globalThis, 'ImageData', { configurable: true, value: FakeImageData });
+try {
+  const imageData = decodeToImageData(new Uint8Array(readFileSync('testimages/heic_b.heic')));
+  assert.equal(imageData.data, capturedImageDataPixels);
+  assert.ok(capturedImageDataPixels!.buffer instanceof ArrayBuffer);
+  assert.deepEqual([imageData.width, imageData.height], [320, 240]);
+} finally {
+  if (originalImageData === undefined) delete (globalThis as { ImageData?: unknown }).ImageData;
+  else Object.defineProperty(globalThis, 'ImageData', { configurable: true, value: originalImageData });
+}
+console.log('ok ImageData receives the decoder\'s ArrayBuffer-backed pixel view');
+
+// Sparse RBSP escape tracking must retain exact EBSP offsets without the old
+// full-size Uint32Array map, and escape-free NAL units should remain zero-copy.
+const plainNalPacket = new Uint8Array([4, 0x28, 0x01, 0x04, 0x80]);
+const plainNal = nalsFromLengthPrefixed(plainNalPacket, 1)[0]!;
+assert.equal(plainNal.rbsp.buffer, plainNalPacket.buffer);
+assert.equal(plainNal.rbsp.byteOffset, plainNalPacket.byteOffset + 1);
+const escapedNalPacket = new Uint8Array([11, 0x28, 0x01, 0, 0, 3, 1, 0, 0, 3, 3, 0x80]);
+const escapedNal = nalsFromLengthPrefixed(escapedNalPacket, 1)[0]!;
+assert.deepEqual(Array.from(escapedNal.rbsp), [0x28, 0x01, 0, 0, 1, 0, 0, 3, 0x80]);
+assert.deepEqual(escapedNal.skippedBytes, [4, 8]);
+assert.equal(rbspOffsetToEbsp(4, escapedNal.skippedBytes!), 5);
+assert.equal(rbspOffsetToEbsp(7, escapedNal.skippedBytes!), 9);
+assert.equal(countSkippedBytesInRange(escapedNal.skippedBytes!, 4, 8), 2);
+const ignoredNalPacket = new Uint8Array([7, 0x46, 0x01, 0, 0, 3, 1, 0x80]); // AUD, type 35
+const ignoredNal = nalsFromLengthPrefixed(ignoredNalPacket, 1)[0]!;
+assert.equal(ignoredNal.rbsp.buffer, ignoredNalPacket.buffer);
+assert.deepEqual(Array.from(ignoredNal.rbsp), [0x46, 0x01, 0, 0, 3, 1, 0x80]);
+assert.deepEqual(ignoredNal.skippedBytes, []);
+console.log('ok HEVC sparse RBSP mapping + zero-copy used/ignored NAL fast paths');
+
+if (typeof SharedArrayBuffer !== 'undefined') {
+  const sharedPacket = new Uint8Array(new SharedArrayBuffer(plainNalPacket.length));
+  sharedPacket.set(plainNalPacket);
+  const sharedNal = nalsFromLengthPrefixed(sharedPacket, 1)[0]!;
+  sharedPacket.fill(0);
+  assert.ok(sharedNal.rbsp.buffer instanceof ArrayBuffer);
+  assert.deepEqual(Array.from(sharedNal.rbsp), [0x28, 0x01, 0x04, 0x80]);
+
+  const annexBytes = new Uint8Array([0, 0, 1, 0x46, 0x01, 0x04, 0x80]);
+  const sharedAnnex = new Uint8Array(new SharedArrayBuffer(annexBytes.length));
+  sharedAnnex.set(annexBytes);
+  const annexNal = nalsFromAnnexB(sharedAnnex)[0]!;
+  sharedAnnex.fill(0);
+  assert.ok(annexNal.rbsp.buffer instanceof ArrayBuffer);
+  assert.deepEqual(Array.from(annexNal.rbsp), [0x46, 0x01, 0x04, 0x80]);
+
+  const config = new HeifFile().parse(new Uint8Array(readFileSync('testimages/heic_a.heic'))).primary.config!;
+  const sharedConfig = new Uint8Array(new SharedArrayBuffer(config.length));
+  sharedConfig.set(config);
+  const parsedSharedConfig = parseHvcC(sharedConfig);
+  sharedConfig.fill(0);
+  assert.ok(parsedSharedConfig.paramSets.every(nal => nal.rbsp.buffer instanceof ArrayBuffer));
+  assert.ok(parsedSharedConfig.paramSets.every(nal => nal.rbsp[0] !== 0 || nal.rbsp[1] !== 0));
+  console.log('ok HEVC direct NAL APIs snapshot SharedArrayBuffer input');
 }
 
 const oddHeic = decodeToRgba(readBase64Fixture('testimages/heic_odd_conformance.heic.b64'));
@@ -48,6 +172,7 @@ heic12Decoder.registerParamSets(heic12Nals);
 const heic12 = heic12Decoder.decodeFrame(heic12Nals.filter(nal => nal.type <= 31));
 assert.equal(heic12.bitDepth, 12);
 assert.equal(heic12.chromaBitDepth, 12);
+assert.ok(heic12.planes.every(plane => plane.data instanceof Uint16Array));
 assert.equal(fnv1aPlanes(heic12.planes), 2876371804);
 console.log('ok HEIC 12-bit: 64x64, raw planes exact');
 
@@ -71,7 +196,75 @@ for (const [name, type, width, height, checksum] of [
   console.log(`ok HEIF ${name}: ${width}x${height}, ${type}`);
 }
 
+// Make every grid cell reference the same coded tile. The cumulative budget is
+// deliberately large enough for one unique tile plus the output grid, but not
+// six redundant tile decodes; this exercises the item/includeAlpha cache.
+const repeatedGrid = readBase64Fixture('testimages/heif_grid.heic.b64');
+const dimgOffset = findAscii(repeatedGrid, 'dimg');
+assert.ok(dimgOffset >= 0, 'grid fixture lost its dimg reference box');
+const repeatedGridView = new DataView(repeatedGrid.buffer, repeatedGrid.byteOffset, repeatedGrid.byteLength);
+const referenceCount = repeatedGridView.getUint16(dimgOffset + 6);
+const firstTileId = repeatedGridView.getUint16(dimgOffset + 8);
+for (let index = 1; index < referenceCount; index++) {
+  repeatedGridView.setUint16(dimgOffset + 8 + index * 2, firstTileId);
+}
+const repeatedGridExpected = decodeToRgba(repeatedGrid);
+const repeatedGridLimited = decodeToRgba(repeatedGrid, { maxTotalPixels: 100_000 });
+assert.deepEqual(repeatedGridLimited, repeatedGridExpected);
+console.log('ok HEIF repeated item references: immutable decode cache + cumulative pixel budget');
+
+const cumulativeItemBytes = readBase64Fixture('testimages/heif_grid.heic.b64');
+assert.throws(
+  () => decodeToRgba(cumulativeItemBytes, { maxItemBytes: 7_000, maxTotalItemBytes: 6_000 }),
+  (error: unknown) => error instanceof DecodeError && error.code === 'RESOURCE_LIMIT' && /cumulative/.test(error.message),
+);
+console.log('ok HEIF cumulative assembled-item byte limit');
+
+for (const path of [
+  'testimages/heic_a.heic',
+  'testimages/heic_odd_conformance.heic.b64',
+  'testimages/heif_grid.heic.b64',
+  'testimages/heif_overlay.heic.b64',
+  'testimages/heif_prem.heic.b64',
+]) {
+  const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
+  assert.deepEqual(decodeHeicToRgba(encoded), decodeToRgba(encoded));
+}
+for (const path of [
+  'testimages/avif_a_8.avif',
+  'testimages/avif_intrabc.avif.b64',
+  'testimages/avif_multitile_multigroup.avif.b64',
+  'testimages/avif_restoration.avif.b64',
+]) {
+  const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
+  assert.deepEqual(decodeAvifToRgba(encoded), decodeToRgba(encoded));
+}
+assert.throws(
+  () => decodeHeicToRgba(new Uint8Array(readFileSync('testimages/avif_a_8.avif'))),
+  (error: unknown) => error instanceof DecodeError && error.code === 'UNSUPPORTED_CODEC' && /AV1/.test(error.message),
+);
+assert.throws(
+  () => decodeAvifToRgba(new Uint8Array(readFileSync('testimages/heic_a.heic'))),
+  (error: unknown) => error instanceof DecodeError && error.code === 'UNSUPPORTED_CODEC' && /HEVC/.test(error.message),
+);
+console.log('ok codec-specific entries: exact derived images + explicit cross-codec errors');
+
+for (const path of [
+  'testimages/heic_a.heic',
+  'testimages/avif_a_8.avif',
+  'testimages/heif_grid.heic.b64',
+]) {
+  const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
+  assert.deepEqual(await decodeToRgbaAsync(encoded), decodeToRgba(encoded));
+}
+console.log('ok async entry dynamically selects HEVC, AV1, and generic HEIF inputs');
+
 const colourFrame = new DecodedFrame(1, 1, 8, CHROMA_444);
+assert.ok(colourFrame.planes.every(plane => plane.data instanceof Uint8Array));
+const mixedDepthFrame = new DecodedFrame(2, 2, 8, CHROMA_444, 10);
+assert.ok(mixedDepthFrame.luma.data instanceof Uint8Array);
+assert.ok(mixedDepthFrame.cb.data instanceof Uint16Array);
+assert.ok(mixedDepthFrame.cr.data instanceof Uint16Array);
 // Identity matrix stores planes as G, B, R.
 colourFrame.luma.data[0] = 150;
 colourFrame.cb.data[0] = 200;
@@ -83,6 +276,25 @@ assert.deepEqual(
   [83, 152, 205, 255],
 );
 console.log('ok NCLX/ICC Display-P3 to sRGB conversion');
+
+const fastColourFrame = new DecodedFrame(17, 13, 8, CHROMA_420);
+for (let plane = 0; plane < fastColourFrame.planes.length; plane++) {
+  const data = fastColourFrame.planes[plane]!.data;
+  for (let index = 0; index < data.length; index++) data[index] = (index * (plane * 17 + 29) + plane * 53) & 255;
+}
+const fastRgba = frameToRgba(fastColourFrame, 6, false, 2, 2, 4, null, false);
+const fastAlpha = frameToAlpha(fastColourFrame, 6, false, 2, 2, 4);
+for (let pixel = 0; pixel < fastAlpha.length; pixel++) assert.equal(fastAlpha[pixel], fastRgba[pixel * 4]);
+const crop = { left: 2, top: 1, width: 11, height: 9 };
+const croppedRgba = frameToRgba(fastColourFrame, 6, false, 2, 2, 4, null, false, crop);
+for (let y = 0; y < crop.height; y++) {
+  const expectedStart = ((crop.top + y) * fastColourFrame.width + crop.left) * 4;
+  assert.deepEqual(
+    croppedRgba.subarray(y * crop.width * 4, (y + 1) * crop.width * 4),
+    fastRgba.subarray(expectedStart, expectedStart + crop.width * 4),
+  );
+}
+console.log('ok scalar colour path: shared chroma sampling, alpha channel, source crop');
 
 const avifCases = [
   ['avif_a_8', 320, 240, 35],
@@ -286,6 +498,15 @@ function sampledRgbPsnr(
 
 function readBase64Fixture(path: string): Uint8Array {
   return new Uint8Array(Buffer.from(readFileSync(path, 'utf8').replace(/\s/g, ''), 'base64'));
+}
+
+function findAscii(bytes: Uint8Array, text: string): number {
+  for (let offset = 0; offset <= bytes.length - text.length; offset++) {
+    let matches = true;
+    for (let index = 0; index < text.length; index++) matches &&= bytes[offset + index] === text.charCodeAt(index);
+    if (matches) return offset;
+  }
+  return -1;
 }
 
 function fnv1a(bytes: Uint8Array): number {

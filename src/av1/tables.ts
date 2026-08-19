@@ -72,8 +72,12 @@ export const txTypeFromUvMode = [0, 1, 2, 0, 3, 1, 2, 2, 1, 3, 1, 2, 3];
 
 export const cflAllowed = new Set([7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
 
+const coefficientScans: (Uint16Array | undefined)[] = [];
+
 /** Normative AV1 coefficient scan in the column-major representation used by dav1d. */
 export function coefficientScan(tx: number): Uint16Array {
+  const cached = coefficientScans[tx];
+  if (cached) return cached;
   const info = transformSizes[tx]!;
   const width = Math.min(32, info.w4 * 4);
   const height = Math.min(32, info.h4 * 4);
@@ -88,5 +92,7 @@ export function coefficientScan(tx: number): Uint16Array {
       for (let x = maxX; x >= minX; x--) result.push(x * height + diagonal - x);
     }
   }
-  return new Uint16Array(result);
+  const scan = new Uint16Array(result);
+  coefficientScans[tx] = scan;
+  return scan;
 }

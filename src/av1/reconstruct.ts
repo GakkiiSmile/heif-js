@@ -39,23 +39,54 @@ interface ReconstructionContext {
   sequence: Av1SequenceHeader;
   header: Av1FrameHeader;
   planes: Plane[];
-  masks: Uint8Array[];
-  smoothMasks: Uint8Array[];
+  masks: ReconstructionMask[];
+  smoothMasks: ReconstructionMask[];
   max: number;
+}
+
+interface ReconstructionMask {
+  data: Uint8Array;
+  width: number;
+  height: number;
+  originX: number;
+  originY: number;
+}
+
+export interface ReconstructionBounds {
+  startX: number; endX: number; startY: number; endY: number;
 }
 
 /** Reconstruct an intra-only AV1 still picture from its already decoded block syntax. */
 export function reconstructAv1Frame(
   planes: Plane[], blocks: readonly Av1DecodedBlock[],
   sequence: Av1SequenceHeader, header: Av1FrameHeader,
+  bounds?: ReconstructionBounds,
 ): void {
   const context: ReconstructionContext = {
     sequence, header, planes,
-    masks: planes.map(plane => new Uint8Array(plane.width * plane.height)),
-    smoothMasks: planes.map(plane => new Uint8Array(plane.width * plane.height)),
+    masks: planes.map((plane, index) => createReconstructionMask(plane, sequence, index, bounds)),
+    smoothMasks: planes.map((plane, index) => createReconstructionMask(plane, sequence, index, bounds)),
     max: (1 << sequence.bitDepth) - 1,
   };
   for (const block of blocks) reconstructBlock(context, block);
+}
+
+function createReconstructionMask(
+  plane: Plane, sequence: Av1SequenceHeader, planeIndex: number,
+  bounds?: ReconstructionBounds,
+): ReconstructionMask {
+  if (!bounds) {
+    return { data: new Uint8Array(plane.width * plane.height), width: plane.width, height: plane.height,
+      originX: 0, originY: 0 };
+  }
+  const shiftX = planeIndex ? sequence.subsamplingX : 0;
+  const shiftY = planeIndex ? sequence.subsamplingY : 0;
+  const originX = (bounds.startX >> shiftX) * 4;
+  const originY = (bounds.startY >> shiftY) * 4;
+  const endX = Math.min(plane.width, ((bounds.endX + (1 << shiftX) - 1) >> shiftX) * 4);
+  const endY = Math.min(plane.height, ((bounds.endY + (1 << shiftY) - 1) >> shiftY) * 4);
+  const width = Math.max(0, endX - originX), height = Math.max(0, endY - originY);
+  return { data: new Uint8Array(width * height), width, height, originX, originY };
 }
 
 /** Apply the normative horizontal AV1 frame super-resolution filter. */
@@ -593,8 +624,8 @@ function collectEdges(
   const extension = width + height;
   const top = new Uint16Array(extension);
   const left = new Uint16Array(extension);
-  const haveTop = y0 > 0 && mask[(y0 - 1) * plane.width + Math.min(x0, plane.width - 1)] !== 0;
-  const haveLeft = x0 > 0 && mask[Math.min(y0, plane.height - 1) * plane.width + x0 - 1] !== 0;
+  const haveTop = y0 > 0 && maskValue(mask, Math.min(x0, plane.width - 1), y0 - 1) !== 0;
+  const haveLeft = x0 > 0 && maskValue(mask, x0 - 1, Math.min(y0, plane.height - 1)) !== 0;
   const midpoint = (context.max + 1) >> 1;
 
   let lastTop = haveTop ? plane.data[(y0 - 1) * plane.stride + x0]! :
@@ -603,7 +634,7 @@ function collectEdges(
   let topEnded = false;
   for (let i = 0; i < extension; i++) {
     const x = Math.min(x0 + i, plane.width - 1);
-    if (i < topSampleLimit && haveTop && !topEnded && mask[(y0 - 1) * plane.width + x]) {
+    if (i < topSampleLimit && haveTop && !topEnded && maskValue(mask, x, y0 - 1)) {
       lastTop = plane.data[(y0 - 1) * plane.stride + x]!;
     } else if (haveTop) topEnded = true;
     top[i] = lastTop;
@@ -614,13 +645,13 @@ function collectEdges(
   let leftEnded = false;
   for (let i = 0; i < extension; i++) {
     const y = Math.min(y0 + i, plane.height - 1);
-    if (i < leftSampleLimit && haveLeft && !leftEnded && mask[y * plane.width + x0 - 1]) {
+    if (i < leftSampleLimit && haveLeft && !leftEnded && maskValue(mask, x0 - 1, y)) {
       lastLeft = plane.data[y * plane.stride + x0 - 1]!;
     } else if (haveLeft) leftEnded = true;
     left[i] = lastLeft;
   }
   let topLeft = midpoint;
-  if (haveTop && haveLeft && mask[(y0 - 1) * plane.width + x0 - 1]) topLeft = plane.data[(y0 - 1) * plane.stride + x0 - 1]!;
+  if (haveTop && haveLeft && maskValue(mask, x0 - 1, y0 - 1)) topLeft = plane.data[(y0 - 1) * plane.stride + x0 - 1]!;
   else if (haveTop) topLeft = top[0]!;
   else if (haveLeft) topLeft = left[0]!;
   return { top, left, topLeft, haveTop, haveLeft };
@@ -628,8 +659,7 @@ function collectEdges(
 
 function mark(context: ReconstructionContext, plane: number, x0: number, y0: number, width: number, height: number): void {
   const target = context.masks[plane]!;
-  const planeWidth = context.planes[plane]!.width;
-  for (let y = 0; y < height; y++) target.fill(1, (y0 + y) * planeWidth + x0, (y0 + y) * planeWidth + x0 + width);
+  fillMask(target, x0, y0, width, height, 1);
 }
 
 function markSmooth(
@@ -637,19 +667,34 @@ function markSmooth(
   x0: number, y0: number, width: number, height: number, smooth: boolean,
 ): void {
   const target = context.smoothMasks[plane]!;
-  const planeWidth = context.planes[plane]!.width;
-  for (let y = 0; y < height; y++) {
-    target.fill(+smooth, (y0 + y) * planeWidth + x0, (y0 + y) * planeWidth + x0 + width);
-  }
+  fillMask(target, x0, y0, width, height, +smooth);
 }
 
 function filterType(
   context: ReconstructionContext, plane: number, x0: number, y0: number,
 ): number {
-  const width = context.planes[plane]!.width;
   const smooth = context.smoothMasks[plane]!;
-  return +((y0 > 0 && smooth[(y0 - 1) * width + x0] !== 0) ||
-    (x0 > 0 && smooth[y0 * width + x0 - 1] !== 0));
+  return +((y0 > 0 && maskValue(smooth, x0, y0 - 1) !== 0) ||
+    (x0 > 0 && maskValue(smooth, x0 - 1, y0) !== 0));
+}
+
+function maskValue(mask: ReconstructionMask, x: number, y: number): number {
+  const localX = x - mask.originX, localY = y - mask.originY;
+  return localX < 0 || localY < 0 || localX >= mask.width || localY >= mask.height ? 0 :
+    mask.data[localY * mask.width + localX]!;
+}
+
+function fillMask(
+  mask: ReconstructionMask, x: number, y: number, width: number, height: number, value: number,
+): void {
+  const startX = Math.max(0, x - mask.originX);
+  const endX = Math.min(mask.width, x - mask.originX + width);
+  const startY = Math.max(0, y - mask.originY);
+  const endY = Math.min(mask.height, y - mask.originY + height);
+  if (startX >= endX || startY >= endY) return;
+  for (let localY = startY; localY < endY; localY++) {
+    mask.data.fill(value, localY * mask.width + startX, localY * mask.width + endX);
+  }
 }
 
 function fillBlock(plane: Plane, x0: number, y0: number, width: number, height: number, value: number): void {

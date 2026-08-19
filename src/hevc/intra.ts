@@ -2,7 +2,23 @@
  *  filtering, and the 35 prediction modes. */
 import { INTRA_ANGLE, INV_ANGLE } from './tables.ts';
 import { Plane } from '../frame.ts';
-import { debugEnabled, debugWrite } from '../debug.ts';
+import { debugWrite } from '../debug.ts';
+
+export interface IntraScratch {
+  border: Int32Array;
+  available: Uint8Array;
+  filtered: Int32Array;
+  reference: Int32Array;
+}
+
+export function createIntraScratch(): IntraScratch {
+  return {
+    border: new Int32Array(2 * 64 + 1),
+    available: new Uint8Array(2 * 64 + 1),
+    filtered: new Int32Array(2 * 64 + 1),
+    reference: new Int32Array(4 * 32 + 1),
+  };
+}
 
 export interface IntraCtx {
   planes: Plane[];
@@ -18,6 +34,8 @@ export interface IntraCtx {
   currentSliceId?: number;
   tileIdMap?: Int32Array;
   currentTileId?: number;
+  scratch?: IntraScratch;
+  tuDebug?: boolean;
 }
 
 const clipBd = (v: number, bd: number) => v < 0 ? 0 : v >= (1 << bd) ? (1 << bd) - 1 : v;
@@ -35,48 +53,93 @@ export function intraPredict(
   const log2MinTb = ctx.log2MinTb;
 
   // border[0] = top-left; border[-1-y] = left; border[1+x] = top / top-right
-  const border = new Int32Array(2 * 64 + 1);
+  const scratch = ctx.scratch ?? createIntraScratch();
+  const border = scratch.border;
   const off = 64;
-  const avail = new Uint8Array(2 * 64 + 1);
+  const avail = scratch.available;
+  avail.fill(0, off - 2 * nT, off + 2 * nT + 1);
   const stride = plane.stride;
   const W = plane.width, H = plane.height;
 
   // availability in 4x4 grid coordinates of this component
   const SubW = cIdx === 0 || ctx.chromaArrayType === 3 ? 1 : 2;
   const SubH = cIdx === 0 || ctx.chromaArrayType === 2 || ctx.chromaArrayType === 3 ? 1 : 2;
-  const tbX = (x: number) => (x * SubW) >> log2MinTb;
-  const tbY = (y: number) => (y * SubH) >> log2MinTb;
-  const currZ = ctx.minTbAddrZs
-    ? ctx.minTbAddrZs[tbX(xB) + tbY(yB) * ctx.picWidthInTbs]!
+  const subWShift = SubW - 1, subHShift = SubH - 1;
+  const minTbAddrZs = ctx.minTbAddrZs;
+  const picWidthInTbs = ctx.picWidthInTbs;
+  const currTbX = (xB << subWShift) >> log2MinTb;
+  const currTbY = (yB << subHShift) >> log2MinTb;
+  const currZ = minTbAddrZs
+    ? minTbAddrZs[currTbX + currTbY * picWidthInTbs]!
     : -1;
-
-  const canUse = (x: number, y: number): boolean => {
-    if (x < 0 || y < 0 || x >= W || y >= H) return false;
-    const gi = tbX(x) + tbY(y) * ctx.picWidthInTbs;
-    if (ctx.sliceIdMap && ctx.sliceIdMap[gi] !== ctx.currentSliceId) return false;
-    if (ctx.tileIdMap && ctx.tileIdMap[gi] !== ctx.currentTileId) return false;
-    if (!ctx.minTbAddrZs) return true; // assume decoded (we only predict from decoded area)
-    const gz = ctx.minTbAddrZs[tbX(x) + tbY(y) * ctx.picWidthInTbs]!;
-    return gz <= currZ;
-  };
+  const sliceIdMap = ctx.sliceIdMap, tileIdMap = ctx.tileIdMap;
+  const currentSliceId = ctx.currentSliceId, currentTileId = ctx.currentTileId;
+  const data = plane.data;
 
   let nAvail = 0;
   let firstValue = 0;
-  const setAvail = (i: number, x: number, y: number) => {
-    if (!canUse(x, y)) return;
-    if (nAvail === 0) firstValue = plane.data[x + y * stride]!;
-    avail[off + i] = 1;
-    border[off + i] = plane.data[x + y * stride]!;
-    nAvail++;
-  };
 
   // left column: border[-1-y] for y = nT-1 .. 0 collected bottom-up (order matters for firstValue)
-  for (let y = 2 * nT - 1; y >= 0; y--) setAvail(-1 - y, xB - 1, yB + y);
-  setAvail(0, xB - 1, yB - 1);
-  for (let x = 0; x < 2 * nT; x++) setAvail(1 + x, xB + x, yB - 1);
+  const leftX = xB - 1;
+  if (leftX >= 0) {
+    const tbX = (leftX << subWShift) >> log2MinTb;
+    let previousGi = -1, usable = false;
+    for (let y = 2 * nT - 1; y >= 0; y--) {
+      const sampleY = yB + y;
+      if (sampleY >= H) continue;
+      const gi = tbX + (((sampleY << subHShift) >> log2MinTb) * picWidthInTbs);
+      if (gi !== previousGi) {
+        previousGi = gi;
+        usable = (!sliceIdMap || sliceIdMap[gi] === currentSliceId) &&
+          (!tileIdMap || tileIdMap[gi] === currentTileId) &&
+          (!minTbAddrZs || minTbAddrZs[gi]! <= currZ);
+      }
+      if (!usable) continue;
+      const value = data[leftX + sampleY * stride]!;
+      if (nAvail === 0) firstValue = value;
+      avail[off - 1 - y] = 1;
+      border[off - 1 - y] = value;
+      nAvail++;
+    }
+  }
+  const topY = yB - 1;
+  if (leftX >= 0 && topY >= 0) {
+    const gi = ((leftX << subWShift) >> log2MinTb) +
+      (((topY << subHShift) >> log2MinTb) * picWidthInTbs);
+    if ((!sliceIdMap || sliceIdMap[gi] === currentSliceId) &&
+        (!tileIdMap || tileIdMap[gi] === currentTileId) &&
+        (!minTbAddrZs || minTbAddrZs[gi]! <= currZ)) {
+      const value = data[leftX + topY * stride]!;
+      if (nAvail === 0) firstValue = value;
+      avail[off] = 1;
+      border[off] = value;
+      nAvail++;
+    }
+  }
+  if (topY >= 0) {
+    const tbY = ((topY << subHShift) >> log2MinTb) * picWidthInTbs;
+    let previousGi = -1, usable = false;
+    for (let x = 0; x < 2 * nT; x++) {
+      const sampleX = xB + x;
+      if (sampleX >= W) break;
+      const gi = ((sampleX << subWShift) >> log2MinTb) + tbY;
+      if (gi !== previousGi) {
+        previousGi = gi;
+        usable = (!sliceIdMap || sliceIdMap[gi] === currentSliceId) &&
+          (!tileIdMap || tileIdMap[gi] === currentTileId) &&
+          (!minTbAddrZs || minTbAddrZs[gi]! <= currZ);
+      }
+      if (!usable) continue;
+      const value = data[sampleX + topY * stride]!;
+      if (nAvail === 0) firstValue = value;
+      avail[off + 1 + x] = 1;
+      border[off + 1 + x] = value;
+      nAvail++;
+    }
+  }
 
   // ---- reference sample substitution (8.4.4.2.2)
-  if (debugEnabled('HEVC_TU_DEBUG') && xB === 0 && yB === 0) {
+  if (ctx.tuDebug && xB === 0 && yB === 0) {
     debugWrite(`PREDDBG nAvail=${nAvail} first=${firstValue} bM1=${border[off - 1]} b0=${border[off]} predMode=${predMode} nT=${nT}\n`);
   }
   if (nAvail !== 4 * nT + 1) {
@@ -90,7 +153,7 @@ export function intraPredict(
     }
   }
 
-  if (debugEnabled('HEVC_TU_DEBUG') && xB === 0 && yB === 0) {
+  if (ctx.tuDebug && xB === 0 && yB === 0) {
     debugWrite(`PREDDBG2 bd=${bd} bM1=${border[off - 1]} b0=${border[off]} b33=${border[off + 33]}\n`);
   }
 
@@ -104,24 +167,24 @@ export function intraPredict(
       else if (nT === 32) filterFlag = minDistVerHor > 0 ? 1 : 0;
     }
     if (filterFlag) {
-      const p = (i: number) => border[off + i];
       const biInt = ctx.strongIntraSmoothing && cIdx === 0 && nT === 32 &&
-        Math.abs(p(0) + p(64) - 2 * p(32)) < (1 << (bd - 5)) &&
-        Math.abs(p(0) + p(-64) - 2 * p(-32)) < (1 << (bd - 5)) ? 1 : 0;
-      const pF = new Int32Array(2 * 64 + 1);
+        Math.abs(border[off]! + border[off + 64]! - 2 * border[off + 32]!) < (1 << (bd - 5)) &&
+        Math.abs(border[off]! + border[off - 64]! - 2 * border[off - 32]!) < (1 << (bd - 5)) ? 1 : 0;
+      const pF = scratch.filtered;
       if (biInt) {
-        pF[off - 2 * nT] = p(-2 * nT);
-        pF[off + 2 * nT] = p(2 * nT);
-        pF[off] = p(0);
+        const center = border[off]!, negative = border[off - 64]!, positive = border[off + 64]!;
+        pF[off - 2 * nT] = border[off - 2 * nT]!;
+        pF[off + 2 * nT] = border[off + 2 * nT]!;
+        pF[off] = center;
         for (let i = 1; i <= 63; i++) {
-          pF[off - i] = p(0) + ((i * (p(-64) - p(0)) + 32) >> 6);
-          pF[off + i] = p(0) + ((i * (p(64) - p(0)) + 32) >> 6);
+          pF[off - i] = center + ((i * (negative - center) + 32) >> 6);
+          pF[off + i] = center + ((i * (positive - center) + 32) >> 6);
         }
       } else {
-        pF[off - 2 * nT] = p(-2 * nT);
-        pF[off + 2 * nT] = p(2 * nT);
+        pF[off - 2 * nT] = border[off - 2 * nT]!;
+        pF[off + 2 * nT] = border[off + 2 * nT]!;
         for (let i = -(2 * nT - 1); i <= 2 * nT - 1; i++) {
-          pF[off + i] = (p(i + 1) + 2 * p(i) + p(i - 1) + 2) >> 2;
+          pF[off + i] = (border[off + i + 1]! + 2 * border[off + i]! + border[off + i - 1]! + 2) >> 2;
         }
       }
       for (let i = -2 * nT; i <= 2 * nT; i++) border[off + i] = pF[off + i]!;
@@ -130,7 +193,6 @@ export function intraPredict(
 
   const dst = plane.data;
   const dstride = stride;
-  const b = (i: number) => border[off + i];
 
   if (predMode === 0) {
     // planar
@@ -138,8 +200,8 @@ export function intraPredict(
     for (let y = 0; y < nT; y++) {
       for (let x = 0; x < nT; x++) {
         dst[xB + x + (yB + y) * dstride] =
-          ((nT - 1 - x) * b(-1 - y) + (x + 1) * b(1 + nT) +
-            (nT - 1 - y) * b(1 + x) + (y + 1) * b(-1 - nT) + nT) >> (log2nT + 1);
+          ((nT - 1 - x) * border[off - 1 - y]! + (x + 1) * border[off + 1 + nT]! +
+            (nT - 1 - y) * border[off + 1 + x]! + (y + 1) * border[off - 1 - nT]! + nT) >> (log2nT + 1);
       }
     }
     return;
@@ -147,33 +209,40 @@ export function intraPredict(
   if (predMode === 1) {
     // DC
     let sum = 0;
-    for (let i = 0; i < nT; i++) { sum += b(1 + i) + b(-1 - i); }
+    for (let i = 0; i < nT; i++) { sum += border[off + 1 + i]! + border[off - 1 - i]!; }
     const dc = (sum + nT) >> (Math.log2(nT) + 1);
     for (let y = 0; y < nT; y++) for (let x = 0; x < nT; x++) dst[xB + x + (yB + y) * dstride] = dc;
     // boundary filter (cIdx 0, nT < 32)
     if (cIdx === 0 && nT < 32) {
-      dst[xB + yB * dstride] = (b(-1) + 2 * dc + b(1) + 2) >> 2;
-      for (let x = 1; x < nT; x++) dst[xB + x + yB * dstride] = (b(1 + x) + 3 * dc + 2) >> 2;
-      for (let y = 1; y < nT; y++) dst[xB + (yB + y) * dstride] = (b(-1 - y) + 3 * dc + 2) >> 2;
+      dst[xB + yB * dstride] = (border[off - 1]! + 2 * dc + border[off + 1]! + 2) >> 2;
+      for (let x = 1; x < nT; x++) {
+        dst[xB + x + yB * dstride] = (border[off + 1 + x]! + 3 * dc + 2) >> 2;
+      }
+      for (let y = 1; y < nT; y++) {
+        dst[xB + (yB + y) * dstride] = (border[off - 1 - y]! + 3 * dc + 2) >> 2;
+      }
     }
     return;
   }
 
   // angular
   const angle = INTRA_ANGLE[predMode]!;
-  const ref = new Int32Array(4 * 32 + 1);
+  const ref = scratch.reference;
   const roff = 64;
+  // Preserve the zero-initialized semantics of the former per-call buffer for
+  // any reference positions not populated by a particular angular mode.
+  ref.fill(0, roff - 2 * nT, roff + 2 * nT + 1);
   if (predMode >= 18) {
-    for (let x = 0; x <= nT; x++) ref[roff + x] = b(x);
+    for (let x = 0; x <= nT; x++) ref[roff + x] = border[off + x]!;
     if (angle < 0) {
       const inv = INV_ANGLE[predMode - 11]!;
       if ((nT * angle) >> 5 < -1) {
         for (let x = (nT * angle) >> 5; x <= -1; x++) {
-          ref[roff + x] = b(-((x * inv + 128) >> 8));
+          ref[roff + x] = border[off - ((x * inv + 128) >> 8)]!;
         }
       }
     } else {
-      for (let x = nT + 1; x <= 2 * nT; x++) ref[roff + x] = b(x);
+      for (let x = nT + 1; x <= 2 * nT; x++) ref[roff + x] = border[off + x]!;
     }
     for (let y = 0; y < nT; y++) {
       const base = (y + 1) * angle;
@@ -186,20 +255,22 @@ export function intraPredict(
     }
     if (predMode === 26 && cIdx === 0 && nT < 32 && !disableBoundaryFilter) {
       for (let y = 0; y < nT; y++) {
-        dst[xB + (yB + y) * dstride] = clipBd(b(1) + ((b(-1 - y) - b(0)) >> 1), bd);
+        dst[xB + (yB + y) * dstride] = clipBd(
+          border[off + 1]! + ((border[off - 1 - y]! - border[off]!) >> 1), bd,
+        );
       }
     }
   } else {
-    for (let x = 0; x <= nT; x++) ref[roff + x] = b(-x);
+    for (let x = 0; x <= nT; x++) ref[roff + x] = border[off - x]!;
     if (angle < 0) {
       const inv = INV_ANGLE[predMode - 11]!;
       if ((nT * angle) >> 5 < -1) {
         for (let x = (nT * angle) >> 5; x <= -1; x++) {
-          ref[roff + x] = b((x * inv + 128) >> 8);
+          ref[roff + x] = border[off + ((x * inv + 128) >> 8)]!;
         }
       }
     } else {
-      for (let x = nT + 1; x <= 2 * nT; x++) ref[roff + x] = b(-x);
+      for (let x = nT + 1; x <= 2 * nT; x++) ref[roff + x] = border[off - x]!;
     }
     for (let y = 0; y < nT; y++) {
       for (let x = 0; x < nT; x++) {
@@ -212,7 +283,9 @@ export function intraPredict(
     }
     if (predMode === 10 && cIdx === 0 && nT < 32 && !disableBoundaryFilter) {
       for (let x = 0; x < nT; x++) {
-        dst[xB + x + yB * dstride] = clipBd(b(-1) + ((b(1 + x) - b(0)) >> 1), bd);
+        dst[xB + x + yB * dstride] = clipBd(
+          border[off - 1]! + ((border[off + 1 + x]! - border[off]!) >> 1), bd,
+        );
       }
     }
   }
@@ -220,32 +293,40 @@ export function intraPredict(
 
 /** MPM candidate derivation (spec 8.4.3). Unavailable neighbors use DC (1). */
 export function fillIntraPredModeCandidates(
-  candA: number | null, candB: number | null,
+  candA: number | null, candB: number | null, out: number[] = [0, 0, 0],
 ): number[] {
   const a = candA ?? 1;
   const b = candB ?? 1;
   if (a === b) {
     if (a < 2) {
-      return [0, 1, 26]; // planar, DC, angular 26
+      out[0] = 0; out[1] = 1; out[2] = 26;
+      return out; // planar, DC, angular 26
     }
     // same angular mode m: [m, m-1, m+1] with wrap in 2..33
-    return [a, 2 + ((a - 2 - 1 + 32) % 32), 2 + ((a - 2 + 1) % 32)];
+    out[0] = a;
+    out[1] = 2 + ((a - 2 - 1 + 32) % 32);
+    out[2] = 2 + ((a - 2 + 1) % 32);
+    return out;
   }
   let third: number;
   if (a !== 0 && b !== 0) third = 0;
   else if (a !== 1 && b !== 1) third = 1;
   else third = 26;
-  return [a, b, third];
+  out[0] = a; out[1] = b; out[2] = third;
+  return out;
 }
 
 export function intraPredModeDecode(prevIntraPredFlag: number, mpmIdx: number, rem: number, candModeList: number[]): number {
   if (prevIntraPredFlag) return candModeList[mpmIdx]!;
   // spec 8.4.3: sort ascending, increment once per candidate <= current mode
-  const l = candModeList.slice().sort((a, b) => a - b);
+  let a = candModeList[0]!, b = candModeList[1]!, c = candModeList[2]!;
+  if (a > b) { const t = a; a = b; b = t; }
+  if (b > c) { const t = b; b = c; c = t; }
+  if (a > b) { const t = a; a = b; b = t; }
   let intraMode = rem;
-  for (let i = 0; i < 3; i++) {
-    if (intraMode >= l[i]!) intraMode++;
-  }
+  if (intraMode >= a) intraMode++;
+  if (intraMode >= b) intraMode++;
+  if (intraMode >= c) intraMode++;
   return intraMode;
 }
 

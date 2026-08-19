@@ -17,11 +17,40 @@ canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
 
 // 非 DOM 环境或需要直接访问像素时：
 const { width, height, data } = decodeToRgba(binary);
-// data 是 width × height × 4 的 Uint8ClampedArray（直通 alpha 的 sRGB RGBA8）。
+// data 是 width × height × 4 的 Uint8ClampedArray（straight-alpha sRGB RGBA8）。
 ```
 
 也可以使用 `decodeToImageData(binary)`。`decodeToRgba` 是同步函数；默认导出的
 `decode` 调用浏览器 `createImageBitmap()`，因此返回 `Promise<ImageBitmap>`。
+
+只需要识别格式或读取 HEIF 元数据时，可使用轻量入口，避免加载 AV1/HEVC
+解码表：
+
+```ts
+import { detectFormat, HeifFile } from 'heic-decode-pure-js/detect';
+```
+
+`HeifFile.parse()` 只解析容器元数据；未使用 item 的 extent 会在首次读取
+`item.data` 时再组装和校验，从而避免复制缩略图或备用表示。普通 `ArrayBuffer`
+输入的单 extent 会保留为零复制 view，因此在读取 lazy `item.data` 前不要修改原输入；
+`SharedArrayBuffer` 输入会先建立稳定快照。
+
+已知输入只使用一种编码时，可通过 `heic-decode-pure-js/heic` 或
+`heic-decode-pure-js/avif` 使用同一套同步 API，只加载对应 codec。希望自动按格式
+拆包且可以接受异步 RGBA 时，可使用：
+
+```ts
+import { decodeToRgbaAsync } from 'heic-decode-pure-js/async';
+
+const image = await decodeToRgbaAsync(binary);
+```
+
+同步 codec 专用入口仍完整支持 grid、identity、overlay、辅助 alpha、变换和资源限制；
+若交给了另一种 codec，会抛出 `DecodeError`，其 `code` 为 `UNSUPPORTED_CODEC`。
+`async` 入口还导出异步的 `decodeToImageDataAsync()`，默认导出 `decode()` 则返回
+`Promise<ImageBitmap>`。为了在动态 `import()` 期间隔离调用方修改，异步入口会在首次
+`await` 前复制一份编码输入；同步入口不会额外复制普通 `ArrayBuffer` backing，
+但会为 `SharedArrayBuffer` 建立快照。
 
 ## 解码能力
 
@@ -59,6 +88,7 @@ const bitmap = await decode(binary, {
   maxDimension: 100_000,
   maxPixels: 120_000_000,
   maxTotalPixels: 240_000_000,
+  maxTotalItemBytes: 768 * 1024 * 1024,
 });
 ```
 
@@ -83,6 +113,8 @@ npm install
 npm run build
 npm test
 npm run test:fuzz
+npm run bench
+npm run bench:entries
 ```
 
 回归语料包含 HEIC/AVIF 的多位深和色度格式、IntraBC、多 tile/group、super-res、

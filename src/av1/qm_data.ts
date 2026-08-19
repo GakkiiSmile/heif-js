@@ -8,9 +8,43 @@ for (let index = 0; index < TABLE_AREAS.length; index++) {
   TABLE_OFFSETS[index] = total;
   total += TABLE_AREAS[index]! * 30;
 }
-const binary = atob(QM_BASE64);
-const QM_BYTES = new Uint8Array(binary.length);
-for (let index = 0; index < binary.length; index++) QM_BYTES[index] = binary.charCodeAt(index);
+let qmBytesCache: Uint8Array | null = null;
+
+function qmBytes(): Uint8Array {
+  if (qmBytesCache) return qmBytesCache;
+  const fromBase64 = (
+    Uint8Array as typeof Uint8Array & { fromBase64?: (text: string) => Uint8Array }
+  ).fromBase64;
+  qmBytesCache = fromBase64
+    ? fromBase64.call(Uint8Array, QM_BASE64)
+    : decodeQmBase64(QM_BASE64);
+  return qmBytesCache;
+}
+
+// QM_BASE64 is generated, trusted, unpadded data, so the portable fallback only
+// implements the exact Base64 subset needed here.
+function decodeQmBase64(text: string): Uint8Array {
+  const bytes = new Uint8Array((text.length >>> 2) * 3);
+  let output = 0;
+  for (let index = 0; index < text.length; index += 4) {
+    const value =
+      base64Value(text.charCodeAt(index)) * 0x40000 +
+      base64Value(text.charCodeAt(index + 1)) * 0x1000 +
+      base64Value(text.charCodeAt(index + 2)) * 0x40 +
+      base64Value(text.charCodeAt(index + 3));
+    bytes[output++] = value >>> 16;
+    bytes[output++] = value >>> 8;
+    bytes[output++] = value;
+  }
+  return bytes;
+}
+
+function base64Value(code: number): number {
+  if (code >= 65 && code <= 90) return code - 65;
+  if (code >= 97 && code <= 122) return code - 71;
+  if (code >= 48 && code <= 57) return code + 4;
+  return code === 43 ? 62 : 63;
+}
 
 // dav1d stores transform coefficients transposed, hence rectangular W/H map inversely.
 const TX_TO_TABLE = [0, 4, 9, 13, 13, 3, 1, 8, 5, 12, 10, 13, 13, 7, 2, 11, 6, 12, 10] as const;
@@ -19,6 +53,5 @@ export function quantMatrixValue(level: number, chroma: boolean, tx: number, coe
   if (level >= 15) return 32;
   const table = TX_TO_TABLE[tx] ?? 0;
   const area = TABLE_AREAS[table]!;
-  return QM_BYTES[TABLE_OFFSETS[table]! + (level * 2 + +chroma) * area + coefficient] ?? 32;
+  return qmBytes()[TABLE_OFFSETS[table]! + (level * 2 + +chroma) * area + coefficient] ?? 32;
 }
-

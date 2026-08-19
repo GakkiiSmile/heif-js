@@ -8,23 +8,27 @@ export const NAL_VPS = 32, NAL_SPS = 33, NAL_PPS = 34, NAL_AUD = 35,
 
 export interface HevcNal {
   type: number;
-  rbsp: Uint8Array;   // emulation-prevention bytes removed
-  /** Original EBSP byte index for every byte in `rbsp`. */
-  rbspToEbsp?: Uint32Array;
+  /** Unescaped RBSP for decoder-consumed NALs; original EBSP view for ignored metadata NALs. */
+  rbsp: Uint8Array;
   /** Original EBSP indices of removed emulation-prevention bytes. */
   skippedBytes?: number[];
 }
 
-/** Remove 0x000003 emulation prevention bytes. */
-export function unescapeRbsp(u8: Uint8Array): Uint8Array {
-  return unescapeRbspWithMap(u8).rbsp;
+function snapshotSharedInput(bytes: Uint8Array): Uint8Array {
+  // Zero-copy views are only safe for immutable ArrayBuffer-backed input. A
+  // SharedArrayBuffer producer could otherwise mutate CABAC/RBSP bytes while a
+  // synchronous decode is in progress.
+  return bytes.buffer instanceof ArrayBuffer ? bytes : new Uint8Array(bytes);
 }
 
-function unescapeRbspWithMap(u8: Uint8Array): Pick<HevcNal, 'rbsp' | 'rbspToEbsp' | 'skippedBytes'> {
-  const out = new Uint8Array(u8.length);
-  const map = new Uint32Array(u8.length);
+/** Remove 0x000003 emulation prevention bytes. */
+export function unescapeRbsp(u8: Uint8Array): Uint8Array {
+  return unescapeRbspSparse(snapshotSharedInput(u8)).rbsp;
+}
+
+function unescapeRbspSparse(u8: Uint8Array): Pick<HevcNal, 'rbsp' | 'skippedBytes'> {
   const skippedBytes: number[] = [];
-  let o = 0, zeros = 0;
+  let zeros = 0;
   for (let i = 0; i < u8.length; i++) {
     const b = u8[i]!;
     if (zeros >= 2 && b === 3) {
@@ -33,12 +37,62 @@ function unescapeRbspWithMap(u8: Uint8Array): Pick<HevcNal, 'rbsp' | 'rbspToEbsp
       zeros = 0;
       continue;
     }
-    out[o] = b;
-    map[o] = i;
-    o++;
     zeros = b === 0 ? zeros + 1 : 0;
   }
-  return { rbsp: out.subarray(0, o), rbspToEbsp: map.subarray(0, o), skippedBytes };
+  // Most short parameter sets, and some complete slices, contain no escape
+  // bytes. Preserve their original view instead of allocating and copying.
+  if (!skippedBytes.length) return { rbsp: u8, skippedBytes };
+
+  const out = new Uint8Array(u8.length - skippedBytes.length);
+  let skippedIndex = 0, destination = 0;
+  for (let source = 0; source < u8.length; source++) {
+    if (skippedBytes[skippedIndex] === source) {
+      skippedIndex++;
+      continue;
+    }
+    out[destination++] = u8[source]!;
+  }
+  return { rbsp: out, skippedBytes };
+}
+
+function decoderNalPayload(type: number, nal: Uint8Array): Pick<HevcNal, 'rbsp' | 'skippedBytes'> {
+  // VCL NAL units plus VPS/SPS/PPS are the only payloads consumed by this
+  // still-image decoder. AUD/SEI and other metadata retain their original view.
+  return type <= NAL_PPS ? unescapeRbspSparse(nal) : { rbsp: nal, skippedBytes: [] };
+}
+
+/** Map one RBSP byte offset back to EBSP using sparse removed-byte positions. */
+export function rbspOffsetToEbsp(rbspOffset: number, skippedBytes: readonly number[]): number {
+  // For skipped byte i, all following RBSP offsets shift once when
+  // skippedBytes[i] - i <= rbspOffset. This monotonic key permits binary search.
+  let lo = 0, hi = skippedBytes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (skippedBytes[mid]! - mid <= rbspOffset) lo = mid + 1;
+    else hi = mid;
+  }
+  return rbspOffset + lo;
+}
+
+/** Count sparse escape positions in an inclusive EBSP byte range. */
+export function countSkippedBytesInRange(
+  skippedBytes: readonly number[], startInclusive: number, endInclusive: number,
+): number {
+  if (endInclusive < startInclusive || !skippedBytes.length) return 0;
+  let lo = 0, hi = skippedBytes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (skippedBytes[mid]! < startInclusive) lo = mid + 1;
+    else hi = mid;
+  }
+  const first = lo;
+  hi = skippedBytes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (skippedBytes[mid]! <= endInclusive) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo - first;
 }
 
 export interface HvcC {
@@ -47,6 +101,7 @@ export interface HvcC {
 }
 
 export function parseHvcC(payload: Uint8Array): HvcC {
+  payload = snapshotSharedInput(payload);
   // layout: [0] version; [1] profile info; [2..5] compat flags; [6..11] constraint flags;
   // [12] level_idc; [13..14] min_spatial_segmentation; [15] parallelismType;
   // [16] chromaFormat; [17] bitDepthLumaMinus8; [18] bitDepthChromaMinus8;
@@ -75,7 +130,7 @@ export function parseHvcC(payload: Uint8Array): HvcC {
       validateNalHeader(nal);
       const actualType = (nal[0]! >> 1) & 0x3f;
       if (actualType !== nalType) throw new Error('HEVC: hvcC array type does not match its NAL unit');
-      paramSets.push({ type: nalType, ...unescapeRbspWithMap(nal) });
+      paramSets.push({ type: nalType, ...decoderNalPayload(nalType, nal) });
       pos += length;
     }
   }
@@ -85,6 +140,7 @@ export function parseHvcC(payload: Uint8Array): HvcC {
 
 /** Extract NAL units from an hvc1 item payload (length-prefixed). */
 export function nalsFromLengthPrefixed(u8: Uint8Array, lengthSize: number): HevcNal[] {
+  u8 = snapshotSharedInput(u8);
   if (lengthSize !== 1 && lengthSize !== 2 && lengthSize !== 4) {
     throw new Error(`HEVC: invalid NAL length size ${lengthSize}`);
   }
@@ -99,7 +155,7 @@ export function nalsFromLengthPrefixed(u8: Uint8Array, lengthSize: number): Hevc
     pos += len;
     validateNalHeader(nal);
     const type = (nal[0]! >> 1) & 0x3F;
-    out.push({ type, ...unescapeRbspWithMap(nal) });
+    out.push({ type, ...decoderNalPayload(type, nal) });
   }
   if (pos !== u8.length) throw new Error('HEVC: truncated NAL length field');
   return out;
@@ -107,6 +163,7 @@ export function nalsFromLengthPrefixed(u8: Uint8Array, lengthSize: number): Hevc
 
 /** Extract NAL units from an Annex-B stream (00 00 01 start codes). */
 export function nalsFromAnnexB(u8: Uint8Array): HevcNal[] {
+  u8 = snapshotSharedInput(u8);
   const out: HevcNal[] = [];
   let starts: number[] = [];
   let i = 0;
@@ -122,7 +179,7 @@ export function nalsFromAnnexB(u8: Uint8Array): HevcNal[] {
     if (!nal.length) continue;
     validateNalHeader(nal);
     const type = (nal[0]! >> 1) & 0x3F;
-    out.push({ type, ...unescapeRbspWithMap(nal) });
+    out.push({ type, ...decoderNalPayload(type, nal) });
   }
   return out;
 }

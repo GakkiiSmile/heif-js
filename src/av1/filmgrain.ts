@@ -1,46 +1,55 @@
-import type { DecodedFrame } from '../frame.ts';
+import type { DecodedFrame, SampleArray } from '../frame.ts';
 import type { Av1FilmGrain, Av1SequenceHeader } from './obu.ts';
 import { gaussianSequence } from './grain_data.ts';
 
 const GRAIN_WIDTH = 82, GRAIN_HEIGHT = 73, BLOCK_SIZE = 32;
+const FILM_GRAIN_SCRATCH = {
+  lumaGrain: new Int16Array(GRAIN_WIDTH * GRAIN_HEIGHT),
+  chromaGrain: new Int16Array(GRAIN_WIDTH * GRAIN_HEIGHT),
+  yScaling: new Uint8Array(1 << 12),
+  uvScaling: new Uint8Array(1 << 12),
+  currentOffsets: new Uint8Array(0),
+  previousOffsets: new Uint8Array(0),
+};
 
 /** Synthesize AV1 film grain over the fully filtered output frame. */
 export function applyFilmGrain(
   frame: DecodedFrame, data: Av1FilmGrain | null, sequence: Av1SequenceHeader,
 ): void {
   if (!data) return;
-  const source = frame.planes.map(plane => new Uint16Array(plane.data));
-  const scaling = [
-    generateScaling(sequence.bitDepth, data.yPoints),
-    generateScaling(sequence.bitDepth, data.uvPoints[0]),
-    generateScaling(sequence.bitDepth, data.uvPoints[1]),
-  ];
-  const lumaGrain = generateLumaGrain(data, sequence.bitDepth);
-  const chromaGrain: [Int16Array | null, Int16Array | null] = [null, null];
-  if (frame.planes.length > 1) {
-    for (let plane = 0; plane < 2; plane++) {
-      if (data.uvPoints[plane].length || data.chromaScalingFromLuma) {
-        chromaGrain[plane] = generateChromaGrain(
-          data, lumaGrain, plane, sequence.subsamplingX, sequence.subsamplingY, sequence.bitDepth,
-        );
-      }
-    }
-  }
+  const activeY = data.yPoints.length > 0;
+  const activeChroma: [boolean, boolean] = frame.planes.length > 1 ? [
+    data.uvPoints[0].length > 0 || data.chromaScalingFromLuma,
+    data.uvPoints[1].length > 0 || data.chromaScalingFromLuma,
+  ] : [false, false];
+  if (!activeY && !activeChroma[0] && !activeChroma[1]) return;
+  const source = frame.planes.map((plane, index) => {
+    if (index === 0) return activeY ? plane.data.slice() : plane.data;
+    return activeChroma[index - 1] ? plane.data.slice() : null;
+  });
+  const yScalingNeeded = activeY || data.chromaScalingFromLuma && (activeChroma[0] || activeChroma[1]);
+  const yScaling = yScalingNeeded ?
+    generateScaling(sequence.bitDepth, data.yPoints, FILM_GRAIN_SCRATCH.yScaling) : null;
+  const lumaGrain = activeY ?
+    generateLumaGrain(data, sequence.bitDepth, FILM_GRAIN_SCRATCH.lumaGrain) : FILM_GRAIN_SCRATCH.lumaGrain;
 
-  if (data.yPoints.length) {
-    applyPlaneGrain(frame, source, 0, lumaGrain, scaling[0]!, data, sequence, 0, 0);
+  if (activeY) {
+    applyPlaneGrain(frame, source, 0, lumaGrain, yScaling!, data, sequence, 0, 0);
   }
   for (let plane = 0; plane < 2; plane++) {
-    if (chromaGrain[plane]) {
-      applyPlaneGrain(frame, source, plane + 1, chromaGrain[plane]!,
-        data.chromaScalingFromLuma ? scaling[0]! : scaling[plane + 1]!,
-        data, sequence, sequence.subsamplingX, sequence.subsamplingY);
-    }
+    if (!activeChroma[plane]) continue;
+    const chromaGrain = generateChromaGrain(
+      data, lumaGrain, plane, sequence.subsamplingX, sequence.subsamplingY, sequence.bitDepth,
+      FILM_GRAIN_SCRATCH.chromaGrain,
+    );
+    const scaling = data.chromaScalingFromLuma ? yScaling! :
+      generateScaling(sequence.bitDepth, data.uvPoints[plane], FILM_GRAIN_SCRATCH.uvScaling);
+    applyPlaneGrain(frame, source, plane + 1, chromaGrain, scaling,
+      data, sequence, sequence.subsamplingX, sequence.subsamplingY);
   }
 }
 
-function generateLumaGrain(data: Av1FilmGrain, bitDepth: number): Int16Array {
-  const grain = new Int16Array(GRAIN_WIDTH * GRAIN_HEIGHT);
+function generateLumaGrain(data: Av1FilmGrain, bitDepth: number, grain: Int16Array): Int16Array {
   const state = { value: data.seed };
   const bitDepthShift = bitDepth - 8;
   const shift = 4 - bitDepthShift + data.grainScaleShift;
@@ -71,8 +80,8 @@ function generateLumaGrain(data: Av1FilmGrain, bitDepth: number): Int16Array {
 function generateChromaGrain(
   data: Av1FilmGrain, luma: Int16Array, plane: number,
   subX: number, subY: number, bitDepth: number,
+  grain: Int16Array,
 ): Int16Array {
-  const grain = new Int16Array(GRAIN_WIDTH * GRAIN_HEIGHT);
   const state = { value: data.seed ^ (plane ? 0x49d8 : 0xb524) };
   const bitDepthShift = bitDepth - 8;
   const shift = 4 - bitDepthShift + data.grainScaleShift;
@@ -111,7 +120,7 @@ function generateChromaGrain(
 }
 
 function applyPlaneGrain(
-  frame: DecodedFrame, source: Uint16Array[], planeIndex: number,
+  frame: DecodedFrame, source: (SampleArray | null)[], planeIndex: number,
   grain: Int16Array, scaling: Uint8Array, data: Av1FilmGrain,
   sequence: Av1SequenceHeader, subX: number, subY: number,
 ): void {
@@ -128,15 +137,23 @@ function applyPlaneGrain(
   const maximum = data.clipToRestrictedRange
     ? (planeIndex === 0 || identity ? 235 : 240) << bitDepthShift
     : (1 << sequence.bitDepth) - 1;
-
-  const offsets: number[][] = Array.from({ length: blockRows }, (_, row) => {
-    const state = {
-      value: data.seed ^ ((((row * 37 + 178) & 0xff) << 8)) ^ ((row * 173 + 105) & 0xff),
-    };
-    return Array.from({ length: blockColumns }, () => randomNumber(8, state));
-  });
+  if (FILM_GRAIN_SCRATCH.currentOffsets.length < blockColumns) {
+    FILM_GRAIN_SCRATCH.currentOffsets = new Uint8Array(blockColumns);
+    FILM_GRAIN_SCRATCH.previousOffsets = new Uint8Array(blockColumns);
+  }
+  let currentOffsets = FILM_GRAIN_SCRATCH.currentOffsets;
+  let previousOffsets = FILM_GRAIN_SCRATCH.previousOffsets;
+  const grainStepX = 2 >> subX, grainStepY = 2 >> subY;
 
   for (let blockRow = 0; blockRow < blockRows; blockRow++) {
+    const swap = previousOffsets; previousOffsets = currentOffsets; currentOffsets = swap;
+    let offsetState = data.seed ^ ((((blockRow * 37 + 178) & 0xff) << 8)) ^
+      ((blockRow * 173 + 105) & 0xff);
+    for (let column = 0; column < blockColumns; column++) {
+      const bit = ((offsetState >> 0) ^ (offsetState >> 1) ^ (offsetState >> 3) ^ (offsetState >> 12)) & 1;
+      offsetState = ((offsetState >> 1) | (bit << 15)) & 0xffff;
+      currentOffsets[column] = offsetState >> 8;
+    }
     const y0 = blockRow * blockHeight;
     const height = Math.min(blockHeight, plane.height - y0);
     for (let blockColumn = 0; blockColumn < blockColumns; blockColumn++) {
@@ -144,56 +161,72 @@ function applyPlaneGrain(
       const width = Math.min(blockWidth, plane.width - x0);
       const overlapX = data.overlap && blockColumn ? Math.min(2 >> subX, width) : 0;
       const overlapY = data.overlap && blockRow ? Math.min(2 >> subY, height) : 0;
+      const random = currentOffsets[blockColumn]!;
+      const currentBase = (3 + grainStepY * (3 + (random & 15))) * GRAIN_WIDTH +
+        3 + grainStepX * (3 + (random >> 4));
+      let leftBase = 0, topBase = 0, topLeftBase = 0;
+      if (overlapX) {
+        const leftRandom = currentOffsets[blockColumn - 1]!;
+        leftBase = (3 + grainStepY * (3 + (leftRandom & 15))) * GRAIN_WIDTH +
+          3 + grainStepX * (3 + (leftRandom >> 4)) + blockWidth;
+      }
+      if (overlapY) {
+        const topRandom = previousOffsets[blockColumn]!;
+        topBase = (3 + grainStepY * (3 + (topRandom & 15)) + blockHeight) * GRAIN_WIDTH +
+          3 + grainStepX * (3 + (topRandom >> 4));
+        if (overlapX) {
+          const topLeftRandom = previousOffsets[blockColumn - 1]!;
+          topLeftBase = (3 + grainStepY * (3 + (topLeftRandom & 15)) + blockHeight) * GRAIN_WIDTH +
+            3 + grainStepX * (3 + (topLeftRandom >> 4)) + blockWidth;
+        }
+      }
       for (let y = 0; y < height; y++) {
+        const grainRow = y * GRAIN_WIDTH;
+        const planeRow = (y0 + y) * plane.stride + x0;
+        const lumaY = (y0 + y) << subY;
+        const lumaRow = lumaY * luma.stride;
         for (let x = 0; x < width; x++) {
-          let value = sampleGrain(grain, offsets, blockColumn, blockRow, subX, subY, 0, 0, x, y);
+          let value = grain[currentBase + grainRow + x]!;
           if (x < overlapX) {
-            const old = sampleGrain(grain, offsets, blockColumn, blockRow, subX, subY, 1, 0, x, y);
+            const old = grain[leftBase + grainRow + x]!;
             value = blend(old, value, subX, x);
           }
           if (y < overlapY) {
-            let top = sampleGrain(grain, offsets, blockColumn, blockRow, subX, subY, 0, 1, x, y);
+            let top = grain[topBase + grainRow + x]!;
             if (x < overlapX) {
-              const topLeft = sampleGrain(grain, offsets, blockColumn, blockRow, subX, subY, 1, 1, x, y);
+              const topLeft = grain[topLeftBase + grainRow + x]!;
               top = blend(topLeft, top, subX, x);
             }
             value = blend(top, value, subY, y);
           }
-          value = clamp(value, -grainCenter, grainCenter - 1);
+          value = value < -grainCenter ? -grainCenter : value >= grainCenter ? grainCenter - 1 : value;
 
-          const globalX = x0 + x, globalY = y0 + y;
-          const sourceValue = sourcePlane[globalY * plane.stride + globalX]!;
+          const globalX = x0 + x;
+          const sourceValue = sourcePlane[planeRow + x]!;
           let scalingIndex = sourceValue;
           if (planeIndex) {
-            const lumaX = globalX << subX, lumaY = globalY << subY;
-            let average = sourceLuma[lumaY * luma.stride + lumaX]!;
-            if (subX) average = (average + sourceLuma[lumaY * luma.stride + Math.min(luma.width - 1, lumaX + 1)]! + 1) >> 1;
+            const lumaX = globalX << subX;
+            let average = sourceLuma[lumaRow + lumaX]!;
+            if (subX) {
+              const adjacentX = lumaX + 1 < luma.width ? lumaX + 1 : lumaX;
+              average = (average + sourceLuma[lumaRow + adjacentX]! + 1) >> 1;
+            }
             if (data.chromaScalingFromLuma) scalingIndex = average;
             else {
               const uv = planeIndex - 1;
-              scalingIndex = clamp(((average * data.uvLumaMult[uv] +
-                sourceValue * data.uvMult[uv]) >> 6) + (data.uvOffset[uv] << bitDepthShift),
-              0, (1 << sequence.bitDepth) - 1);
+              const combined = ((average * data.uvLumaMult[uv] + sourceValue * data.uvMult[uv]) >> 6) +
+                (data.uvOffset[uv] << bitDepthShift);
+              const maxIndex = (1 << sequence.bitDepth) - 1;
+              scalingIndex = combined < 0 ? 0 : combined > maxIndex ? maxIndex : combined;
             }
           }
           const noise = round2(scaling[scalingIndex]! * value, data.scalingShift);
-          plane.data[globalY * plane.stride + globalX] = clamp(sourceValue + noise, minimum, maximum);
+          const output = sourceValue + noise;
+          plane.data[planeRow + x] = output < minimum ? minimum : output > maximum ? maximum : output;
         }
       }
     }
   }
-}
-
-function sampleGrain(
-  grain: Int16Array, offsets: number[][], blockX: number, blockY: number,
-  subX: number, subY: number, previousX: number, previousY: number, x: number, y: number,
-): number {
-  const random = offsets[blockY - previousY]![blockX - previousX]!;
-  const offsetX = 3 + (2 >> subX) * (3 + (random >> 4));
-  const offsetY = 3 + (2 >> subY) * (3 + (random & 15));
-  const lutX = offsetX + x + (BLOCK_SIZE >> subX) * previousX;
-  const lutY = offsetY + y + (BLOCK_SIZE >> subY) * previousY;
-  return grain[lutY * GRAIN_WIDTH + lutX]!;
 }
 
 function blend(oldValue: number, newValue: number, subsampling: number, offset: number): number {
@@ -202,10 +235,14 @@ function blend(oldValue: number, newValue: number, subsampling: number, offset: 
     round2(oldValue * 27 + newValue * 17, 5);
 }
 
-function generateScaling(bitDepth: number, points: readonly [number, number][]): Uint8Array {
+function generateScaling(
+  bitDepth: number, points: readonly [number, number][], scaling: Uint8Array,
+): Uint8Array {
   const size = 1 << bitDepth;
-  const scaling = new Uint8Array(size);
-  if (!points.length) return scaling;
+  if (!points.length) {
+    scaling.fill(0, 0, size);
+    return scaling;
+  }
   const shift = bitDepth - 8;
   scaling.fill(points[0]![1], 0, points[0]![0] << shift);
   for (let index = 0; index < points.length - 1; index++) {

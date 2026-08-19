@@ -12,6 +12,21 @@ const COS128 = new Int16Array([
   1567, 1474, 1380, 1285, 1189, 1092, 995, 897,
   799, 700, 601, 501, 401, 301, 201, 101, 0,
 ]);
+const COS256 = new Int16Array(256);
+for (let angle = 0; angle < 256; angle++) {
+  COS256[angle] = angle <= 64 ? COS128[angle]! :
+    angle <= 128 ? -COS128[128 - angle]! :
+    angle <= 192 ? -COS128[angle - 128]! : COS128[256 - angle]!;
+}
+const POWERS_OF_TWO = new Float64Array(32);
+const CLAMP_MINIMUM = new Float64Array(32);
+const CLAMP_MAXIMUM = new Float64Array(32);
+for (let bits = 0; bits < 32; bits++) {
+  const power = 2 ** bits;
+  POWERS_OF_TWO[bits] = power;
+  CLAMP_MINIMUM[bits] = -(power / 2);
+  CLAMP_MAXIMUM[bits] = power / 2 - 1;
+}
 
 const TX_1D_TYPES: readonly (readonly [OneDimensionalType, OneDimensionalType])[] = [
   [0, 0], [1, 0], [0, 1], [1, 1], [2, 0], [0, 2], [2, 2], [1, 2],
@@ -20,12 +35,33 @@ const TX_1D_TYPES: readonly (readonly [OneDimensionalType, OneDimensionalType])[
 
 const TRANSFORM_ROW_SHIFT = [0, 1, 2, 2, 2, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2];
 
+// AV1 transform dimensions are at most 64 and the transform is synchronous
+// with no user callbacks, so these internal work buffers can be reused safely
+// across calls. Returned output storage remains caller-owned.
+const MAX_TRANSFORM_LENGTH = 64;
+const TRANSFORM_INTERMEDIATE = new Int32Array(MAX_TRANSFORM_LENGTH * MAX_TRANSFORM_LENGTH);
+const TRANSFORM_LINE = new Int32Array(MAX_TRANSFORM_LENGTH);
+const TRANSFORM_PERMUTATION = new Int32Array(MAX_TRANSFORM_LENGTH);
+const TRANSFORM_LINE_VIEWS: (Int32Array | undefined)[] = [];
+
+function transformLine(length: number): Int32Array {
+  let view = TRANSFORM_LINE_VIEWS[length];
+  if (!view) {
+    view = TRANSFORM_LINE.subarray(0, length);
+    TRANSFORM_LINE_VIEWS[length] = view;
+  }
+  return view;
+}
+
 /** Apply the normative separable inverse transform to row-major dequantized coefficients. */
 export function inverseTransform2d(
   coefficients: Int32Array, width: number, height: number,
   txSize: number, txType: number, bitDepth: number,
+  output: Int32Array = new Int32Array(width * height),
 ): Int32Array {
-  if (txType === 16) return inverseWht2d(coefficients);
+  const area = width * height;
+  if (output.length < area) throw new RangeError('AV1 inverse-transform output is too small');
+  if (txType === 16) return inverseWht2d(coefficients, output);
   const types = TX_1D_TYPES[txType] ?? TX_1D_TYPES[0]!;
   const verticalType = types[0], horizontalType = types[1];
   const rowClampRange = bitDepth + 8;
@@ -34,43 +70,47 @@ export function inverseTransform2d(
   const columnMaximum = 2 ** (columnClampRange - 1) - 1;
   const rowShift = TRANSFORM_ROW_SHIFT[txSize] ?? 0;
   const rectangular = Math.abs(Math.log2(width) - Math.log2(height)) === 1;
-  const intermediate = new Int32Array(width * height);
+  const maximumLength = Math.max(width, height);
+  const standardSize = area <= TRANSFORM_INTERMEDIATE.length && maximumLength <= MAX_TRANSFORM_LENGTH;
+  const intermediate = standardSize ? TRANSFORM_INTERMEDIATE : new Int32Array(area);
+  const permutation = standardSize ? TRANSFORM_PERMUTATION : new Int32Array(maximumLength);
+  const row = standardSize ? transformLine(width) : new Int32Array(width);
 
   for (let y = 0; y < height; y++) {
-    const row = new Int32Array(width);
     for (let x = 0; x < width; x++) {
       let value = coefficients[y * width + x]!;
       if (rectangular) value = round2(value * 2896, 12);
       row[x] = value;
     }
-    inverse1d(row, horizontalType, rowClampRange);
+    inverse1d(row, horizontalType, rowClampRange, permutation);
     for (let x = 0; x < width; x++) {
       intermediate[y * width + x] = clip(round2(row[x]!, rowShift), columnMinimum, columnMaximum);
     }
   }
 
-  const output = new Int32Array(width * height);
+  const column = standardSize ? transformLine(height) : new Int32Array(height);
   for (let x = 0; x < width; x++) {
-    const column = new Int32Array(height);
     for (let y = 0; y < height; y++) column[y] = intermediate[y * width + x]!;
-    inverse1d(column, verticalType, columnClampRange);
+    inverse1d(column, verticalType, columnClampRange, permutation);
     for (let y = 0; y < height; y++) output[y * width + x] = round2(column[y]!, 4);
   }
   return output;
 }
 
-function inverse1d(values: Int32Array, type: OneDimensionalType, clampRange: number): void {
-  if (type === 0) inverseDct(values, clampRange);
+function inverse1d(
+  values: Int32Array, type: OneDimensionalType, clampRange: number, permutation: Int32Array,
+): void {
+  if (type === 0) inverseDct(values, clampRange, permutation);
   else if (type === 1 || type === 2) {
-    inverseAdst(values, clampRange);
+    inverseAdst(values, clampRange, permutation);
     if (type === 2) values.reverse();
   } else inverseIdentity(values);
 }
 
-function inverseDct(values: Int32Array, clampRange: number): void {
+function inverseDct(values: Int32Array, clampRange: number, permutation: Int32Array): void {
   const n = Math.log2(values.length);
-  const copy = values.slice();
-  for (let i = 0; i < values.length; i++) values[i] = copy[bitReverse(n, i)]!;
+  permutation.set(values, 0);
+  for (let i = 0; i < values.length; i++) values[i] = permutation[bitReverse(n, i)]!;
 
   if (n === 6) for (let i = 0; i <= 15; i++) {
     butterfly(values, 32 + i, 63 - i, 63 - 4 * bitReverse(4, i), false);
@@ -150,13 +190,13 @@ function inverseDct(values: Int32Array, clampRange: number): void {
   if (n === 6) for (let i = 0; i <= 31; i++) hadamard(values, i, 63 - i, false, clampRange);
 }
 
-function inverseAdst(values: Int32Array, clampRange: number): void {
+function inverseAdst(values: Int32Array, clampRange: number, permutation: Int32Array): void {
   if (values.length === 4) {
     inverseAdst4(values);
     return;
   }
   const n = Math.log2(values.length);
-  adstInputPermutation(values);
+  adstInputPermutation(values, permutation);
   if (n === 3) {
     for (let i = 0; i <= 3; i++) butterfly(values, 2 * i, 2 * i + 1, 60 - 16 * i, true);
     for (let i = 0; i <= 3; i++) hadamard(values, i, 4 + i, false, clampRange);
@@ -183,50 +223,46 @@ function inverseAdst(values: Int32Array, clampRange: number): void {
     }
     for (let i = 0; i <= 3; i++) butterfly(values, 2 + 4 * i, 3 + 4 * i, 32, true);
   }
-  adstOutputPermutation(values);
+  adstOutputPermutation(values, permutation);
 }
 
 function inverseAdst4(values: Int32Array): void {
   const t0 = values[0]!, t1 = values[1]!, t2 = values[2]!, t3 = values[3]!;
-  const s = new Float64Array(7);
-  s[0] = 1321 * t0;
-  s[1] = 2482 * t0;
-  s[2] = 3344 * t1;
-  s[3] = 3803 * t2;
-  s[4] = 1321 * t2;
-  s[5] = 2482 * t3;
-  s[6] = 3803 * t3;
+  let s0 = 1321 * t0;
+  let s1 = 2482 * t0;
+  const s3 = 3344 * t1;
   const b7 = t0 - t2 + t3;
-  s[0] += s[3]!;
-  s[1] -= s[4]!;
-  s[3] = s[2]!;
-  s[2] = 3344 * b7;
-  s[0] += s[5]!;
-  s[1] -= s[6]!;
-  const x0 = s[0]! + s[3]!;
-  const x1 = s[1]! + s[3]!;
-  const x2 = s[2]!;
-  const x3 = s[0]! + s[1]! - s[3]!;
+  s0 += 3803 * t2;
+  s1 -= 1321 * t2;
+  const s2 = 3344 * b7;
+  s0 += 2482 * t3;
+  s1 -= 3803 * t3;
+  const x0 = s0 + s3;
+  const x1 = s1 + s3;
+  const x2 = s2;
+  const x3 = s0 + s1 - s3;
   values[0] = round2(x0, 12);
   values[1] = round2(x1, 12);
   values[2] = round2(x2, 12);
   values[3] = round2(x3, 12);
 }
 
-function adstInputPermutation(values: Int32Array): void {
-  const copy = values.slice(), length = values.length;
-  for (let i = 0; i < length; i++) values[i] = copy[(i & 1) ? i - 1 : length - i - 1]!;
+function adstInputPermutation(values: Int32Array, permutation: Int32Array): void {
+  const length = values.length;
+  permutation.set(values, 0);
+  for (let i = 0; i < length; i++) values[i] = permutation[(i & 1) ? i - 1 : length - i - 1]!;
 }
 
-function adstOutputPermutation(values: Int32Array): void {
-  const copy = values.slice(), n = Math.log2(values.length);
+function adstOutputPermutation(values: Int32Array, permutation: Int32Array): void {
+  const n = Math.log2(values.length);
+  permutation.set(values, 0);
   for (let i = 0; i < values.length; i++) {
     const a = (i >> 3) & 1;
     const b = ((i >> 2) & 1) ^ ((i >> 3) & 1);
     const c = ((i >> 1) & 1) ^ ((i >> 2) & 1);
     const d = (i & 1) ^ ((i >> 1) & 1);
     const index = ((d << 3) | (c << 2) | (b << 1) | a) >> (4 - n);
-    values[i] = (i & 1) ? -copy[index]! : copy[index]!;
+    values[i] = (i & 1) ? -permutation[index]! : permutation[index]!;
   }
 }
 
@@ -237,17 +273,16 @@ function inverseIdentity(values: Int32Array): void {
   else for (let i = 0; i < values.length; i++) values[i] = values[i]! * 4;
 }
 
-function inverseWht2d(coefficients: Int32Array): Int32Array {
-  const intermediate = new Int32Array(16);
+function inverseWht2d(coefficients: Int32Array, output: Int32Array): Int32Array {
+  const intermediate = TRANSFORM_INTERMEDIATE;
+  const row = transformLine(4);
   for (let y = 0; y < 4; y++) {
-    const row = new Int32Array(4);
     for (let x = 0; x < 4; x++) row[x] = coefficients[y * 4 + x]!;
     inverseWht1d(row, 2);
     intermediate.set(row, y * 4);
   }
-  const output = new Int32Array(16);
+  const column = row;
   for (let x = 0; x < 4; x++) {
-    const column = new Int32Array(4);
     for (let y = 0; y < 4; y++) column[y] = intermediate[y * 4 + x]!;
     inverseWht1d(column, 0);
     for (let y = 0; y < 4; y++) output[y * 4 + x] = column[y]!;
@@ -272,8 +307,9 @@ function inverseWht1d(values: Int32Array, shift: number): void {
 
 function butterfly(values: Int32Array, a: number, b: number, angle: number, flip: boolean): void {
   const first = values[a]!, second = values[b]!;
-  const x = round2(first * cos128(angle) - second * sin128(angle), 12);
-  const y = round2(first * sin128(angle) + second * cos128(angle), 12);
+  const cosine = COS256[angle & 255]!, sine = COS256[(angle - 64) & 255]!;
+  const x = round2(first * cosine - second * sine, 12);
+  const y = round2(first * sine + second * cosine, 12);
   if (flip) { values[a] = y; values[b] = x; }
   else { values[a] = x; values[b] = y; }
 }
@@ -281,20 +317,10 @@ function butterfly(values: Int32Array, a: number, b: number, angle: number, flip
 function hadamard(values: Int32Array, a: number, b: number, flip: boolean, range: number): void {
   if (flip) { const temporary = a; a = b; b = temporary; }
   const first = values[a]!, second = values[b]!;
-  const minimum = -(2 ** (range - 1)), maximum = 2 ** (range - 1) - 1;
+  const minimum = CLAMP_MINIMUM[range]!, maximum = CLAMP_MAXIMUM[range]!;
   values[a] = clip(first + second, minimum, maximum);
   values[b] = clip(first - second, minimum, maximum);
 }
-
-function cos128(angle: number): number {
-  const normalized = ((angle % 256) + 256) % 256;
-  if (normalized <= 64) return COS128[normalized]!;
-  if (normalized <= 128) return -COS128[128 - normalized]!;
-  if (normalized <= 192) return -COS128[normalized - 128]!;
-  return COS128[256 - normalized]!;
-}
-
-function sin128(angle: number): number { return cos128(angle - 64); }
 
 function bitReverse(bits: number, value: number): number {
   let output = 0;
@@ -303,11 +329,12 @@ function bitReverse(bits: number, value: number): number {
 }
 
 function round2(value: number, bits: number): number {
-  return bits ? Math.floor((value + 2 ** (bits - 1)) / 2 ** bits) : value;
+  const divisor = POWERS_OF_TWO[bits]!;
+  return bits ? Math.floor((value + divisor / 2) / divisor) : value;
 }
 
 function floorShift(value: number, bits: number): number {
-  return bits ? Math.floor(value / 2 ** bits) : value;
+  return bits ? Math.floor(value / POWERS_OF_TWO[bits]!) : value;
 }
 
 function clip(value: number, minimum: number, maximum: number): number {
