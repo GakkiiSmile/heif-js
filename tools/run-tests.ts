@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import decodeDefault, { decode } from '../src/index.ts';
 import { decode as decodeHeic } from '../src/heic.ts';
 import { decode as decodeAvif } from '../src/avif.ts';
-import { decode as decodeAsync } from '../src/async.ts';
 import { detectFormat, HeifFile } from '../src/bmff.ts';
 import { DecodeError } from '../src/decode-core.ts';
 import { Av1Decoder } from '../src/av1/decode.ts';
@@ -25,7 +24,6 @@ assert.equal(decodeDefault, decode);
 assert.deepEqual(Object.keys(await import('../src/index.ts')).sort(), ['decode', 'default']);
 assert.deepEqual(Object.keys(await import('../src/heic.ts')).sort(), ['decode', 'default']);
 assert.deepEqual(Object.keys(await import('../src/avif.ts')).sort(), ['decode', 'default']);
-assert.deepEqual(Object.keys(await import('../src/async.ts')).sort(), ['decode', 'default']);
 console.log('ok public decoder entries only export decode');
 
 for (const [name, width, height] of heicCases) {
@@ -65,10 +63,6 @@ assert.throws(
   () => decode(overlappingInput, { output: new Uint8ClampedArray(overlappingStorage) }),
   (error: unknown) => error instanceof DecodeError && error.code === 'INVALID_INPUT',
 );
-const asyncReusableOutput = new Uint8ClampedArray(reusableOutput.length);
-const asyncOutputReuseDecoded = await decodeAsync(outputReuseEncoded, { output: asyncReusableOutput });
-assert.equal(asyncOutputReuseDecoded.data, asyncReusableOutput);
-assert.deepEqual(asyncOutputReuseDecoded.data, outputReuseExpected.data);
 console.log('ok caller-provided RGBA output buffer reuse + overlap/size validation');
 
 const zeroCopyBytes = new Uint8Array(readFileSync('testimages/heic_a.heic'));
@@ -254,16 +248,6 @@ assert.throws(
   (error: unknown) => error instanceof DecodeError && error.code === 'UNSUPPORTED_CODEC' && /HEVC/.test(error.message),
 );
 console.log('ok codec-specific entries: exact derived images + explicit cross-codec errors');
-
-for (const path of [
-  'testimages/heic_a.heic',
-  'testimages/avif_a_8.avif',
-  'testimages/heif_grid.heic.b64',
-]) {
-  const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
-  assert.deepEqual(await decodeAsync(encoded), decode(encoded));
-}
-console.log('ok async entry dynamically selects HEVC, AV1, and generic HEIF inputs');
 
 const colourFrame = new DecodedFrame(1, 1, 8, CHROMA_444);
 assert.ok(colourFrame.planes.every(plane => plane.data instanceof Uint8Array));

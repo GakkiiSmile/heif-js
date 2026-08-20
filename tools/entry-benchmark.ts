@@ -7,7 +7,7 @@ import ts from 'typescript';
 const built = process.argv.includes('--dist') || process.env.BENCH_DIST === '1';
 const directory = built ? 'dist' : 'src';
 const extension = built ? 'js' : 'ts';
-const entries = ['detect', 'async', 'heic', 'avif', 'index'].map(name => `${directory}/${name}.${extension}`);
+const entries = ['detect', 'heic', 'avif', 'index'].map(name => `${directory}/${name}.${extension}`);
 const runs = Number(process.env.BENCH_IMPORT_RUNS ?? 9);
 if (!Number.isSafeInteger(runs) || runs < 3) throw new Error('BENCH_IMPORT_RUNS must be an integer >= 3');
 

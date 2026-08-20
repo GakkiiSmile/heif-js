@@ -21,10 +21,6 @@
     "./avif": {
       "types": "./dist/avif.d.ts",
       "import": "./dist/avif.js"
-    },
-    "./async": {
-      "types": "./dist/async.d.ts",
-      "import": "./dist/async.js"
     }
   },
   "files": [

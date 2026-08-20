@@ -40,20 +40,9 @@ import { detectFormat, HeifFile } from 'heif-js/detect';
 `SharedArrayBuffer` 输入会先建立稳定快照。
 
 已知输入只使用一种编码时，可通过 `heif-js/heic` 或
-`heif-js/avif` 使用同一套同步 `decode` API，只加载对应 codec。希望自动按格式
-拆包且可以接受异步返回值时，可使用：
-
-```ts
-import { decode } from 'heif-js/async';
-
-const image = await decode(binary);
-```
-
-同步 codec 专用入口仍完整支持 grid、identity、overlay、辅助 alpha、变换和资源限制；
+`heif-js/avif` 使用同一套同步 `decode` API，只加载对应 codec。同步 codec 专用
+入口仍完整支持 grid、identity、overlay、辅助 alpha、变换和资源限制；
 若交给了另一种 codec，会抛出 `DecodeError`，其 `code` 为 `UNSUPPORTED_CODEC`。
-`async` 入口返回 `Promise<DecodedImage>`。为了在动态 `import()` 期间隔离调用方修改，
-它会在首次 `await` 前复制一份编码输入；同步入口不会额外复制普通 `ArrayBuffer`
-backing，但会为 `SharedArrayBuffer` 建立快照。
 
 ## 解码能力
 
