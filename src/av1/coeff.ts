@@ -33,6 +33,7 @@ interface CoefficientOptions {
   subsamplingX?: number;
   subsamplingY?: number;
   lumaTxType?: number;
+  acquireCoefficients?: (length: number) => Int32Array;
   above: Uint8Array;
   left: Uint8Array;
 }
@@ -40,7 +41,7 @@ interface CoefficientOptions {
 export function decodeCoefficients(options: CoefficientOptions): CoefficientResult {
   const { msac, modeCdf, coefCdf, tx, blockSize, plane, intra, yMode, uvMode,
     reducedTransformSet, qIdx, lossless = false, subsamplingX = 1, subsamplingY = 1,
-    lumaTxType = 0, above, left } = options;
+    lumaTxType = 0, acquireCoefficients, above, left } = options;
   const chroma = plane !== 0 ? 1 : 0;
   const info = transformSizes[tx]!;
   const width = Math.min(info.w4, 8) * 4;
@@ -50,7 +51,12 @@ export function decodeCoefficients(options: CoefficientOptions): CoefficientResu
   if (allSkip) {
     return { eob: -1, txType: lossless ? 16 : 0, coefficients: EMPTY_COEFFICIENTS, context: 0x40 };
   }
-  const coefficients = new Int32Array(width * height);
+  const coefficientCount = width * height;
+  const coefficients = acquireCoefficients?.(coefficientCount) ?? new Int32Array(coefficientCount);
+  // A pooled transform buffer may contain values beyond the current EOB from
+  // the preceding block. Fresh typed arrays were implicitly zeroed here, so
+  // preserve the same invariant before entropy decoding writes sparse values.
+  coefficients.fill(0, 0, coefficientCount);
 
   let txType: number;
   if (lossless) txType = 16;

@@ -169,8 +169,9 @@ function frameToPixels(
   const componentRange = fullRange ? chromaMaxValue : 219 * chromaRangeScale;
   const luma = frame.luma;
   const iccTransform = colorManagement && iccProfile ? getIccTransform(iccProfile) : null;
+  const srgbIdentity = colourPrimaries === 1 && transferCharacteristics === 13;
   const manageNclx = colorManagement && !iccTransform && colourPrimaries !== 2 &&
-    transferCharacteristics !== 2 && PRIMARIES[colourPrimaries] !== undefined;
+    transferCharacteristics !== 2 && !srgbIdentity && PRIMARIES[colourPrimaries] !== undefined;
 
   if (chromaFormat === CHROMA_MONO) {
     const rgb: MutableVec3 = [0, 0, 0];
@@ -293,6 +294,14 @@ function writeStandard8(
     }
     return;
   }
+  if (horizontalShift === 1 && verticalShift === 1 && chromaSamplePosition === 1 &&
+      !(left & 1) && !(top & 1)) {
+    writeCoSited420Standard8(
+      out, frame, left, top, width, height, alphaOnly, chromaRange,
+      redScale, blueScale, greenRedScale, greenBlueScale, tables,
+    );
+    return;
+  }
   const x0s = direct ? null : new Uint32Array(width);
   const x1s = direct ? null : new Uint32Array(width);
   const fractionsX = direct ? null : new Float64Array(width);
@@ -349,6 +358,64 @@ function writeStandard8(
         out[offset++] = (yPrime - greenRedScale * pr - greenBlueScale * pb) * 255;
         out[offset++] = (yPrime + blueScale * pb) * 255;
         out[offset++] = 255;
+      }
+    }
+  }
+}
+
+function writeCoSited420Standard8(
+  out: Uint8ClampedArray, frame: DecodedFrame,
+  left: number, top: number, width: number, height: number, alphaOnly: boolean,
+  chromaRange: number, redScale: number, blueScale: number,
+  greenRedScale: number, greenBlueScale: number, tables: Standard8Tables,
+): void {
+  const luma = frame.luma, cb = frame.cb, cr = frame.cr;
+  const lumaData = luma.data, cbData = cb.data, crData = cr.data;
+  let output = 0;
+  for (let y = 0; y < height; y++) {
+    const sourceY = top + y;
+    const chromaY = sourceY >> 1;
+    const y0 = Math.max(0, Math.min(cb.height - 1, (sourceY & 1) ? chromaY : chromaY - 1));
+    const y1 = Math.min(cb.height - 1, y0 + 1);
+    const fractionY = (sourceY & 1) ? 0.25 : 0.75;
+    const inverseY = 1 - fractionY;
+    const chromaRow0 = y0 * cb.stride;
+    const chromaRow1 = y1 * cb.stride;
+    const lumaRow = sourceY * luma.stride + left;
+    for (let x = 0; x < width; x += 2) {
+      const chromaX = (left + x) >> 1;
+      const chromaX1 = Math.min(cb.width - 1, chromaX + 1);
+      const cb0 = cbData[chromaRow0 + chromaX]!;
+      const cb1 = cbData[chromaRow1 + chromaX]!;
+      const cr0 = crData[chromaRow0 + chromaX]!;
+      const cr1 = crData[chromaRow1 + chromaX]!;
+      let cbCode = cb0 * inverseY + cb1 * fractionY;
+      let crCode = cr0 * inverseY + cr1 * fractionY;
+      let yPrime = tables.y[lumaData[lumaRow + x]!]!;
+      let pb = (cbCode - 128) / chromaRange;
+      let pr = (crCode - 128) / chromaRange;
+      out[output++] = (yPrime + redScale * pr) * 255;
+      if (!alphaOnly) {
+        out[output++] = (yPrime - greenRedScale * pr - greenBlueScale * pb) * 255;
+        out[output++] = (yPrime + blueScale * pb) * 255;
+        out[output++] = 255;
+      }
+      if (x + 1 >= width) continue;
+
+      const cbTop = cb0 * 0.5 + cbData[chromaRow0 + chromaX1]! * 0.5;
+      const cbBottom = cb1 * 0.5 + cbData[chromaRow1 + chromaX1]! * 0.5;
+      const crTop = cr0 * 0.5 + crData[chromaRow0 + chromaX1]! * 0.5;
+      const crBottom = cr1 * 0.5 + crData[chromaRow1 + chromaX1]! * 0.5;
+      cbCode = cbTop * inverseY + cbBottom * fractionY;
+      crCode = crTop * inverseY + crBottom * fractionY;
+      yPrime = tables.y[lumaData[lumaRow + x + 1]!]!;
+      pb = (cbCode - 128) / chromaRange;
+      pr = (crCode - 128) / chromaRange;
+      out[output++] = (yPrime + redScale * pr) * 255;
+      if (!alphaOnly) {
+        out[output++] = (yPrime - greenRedScale * pr - greenBlueScale * pb) * 255;
+        out[output++] = (yPrime + blueScale * pb) * 255;
+        out[output++] = 255;
       }
     }
   }

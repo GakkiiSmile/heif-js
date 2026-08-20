@@ -8,7 +8,7 @@ import {
   OBU_FRAME, OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER, OBU_TILE_GROUP,
 } from './obu.ts';
 import type { Av1FrameHeader, Av1SequenceHeader } from './obu.ts';
-import { reconstructAv1Frame, upscaleAv1Frame } from './reconstruct.ts';
+import { createAv1BlockReconstructor, upscaleAv1Frame } from './reconstruct.ts';
 import { applyCdef } from './cdef.ts';
 import { applyDeblock } from './deblock.ts';
 import { applyRestoration } from './restoration.ts';
@@ -123,10 +123,12 @@ export class Av1Decoder {
         startY: header.tileRowStarts[payload.row]! * sbStep4,
         endY: Math.min(Math.ceil(header.height / 4), header.tileRowStarts[payload.row + 1]! * sbStep4),
       };
-      const tile = new TileDecoder(sequence, header, frame, payload.data, bounds);
+      const reconstruct = createAv1BlockReconstructor(frame.planes, sequence, header, bounds);
+      const tile = new TileDecoder(sequence, header, frame, payload.data, bounds, block => {
+        reconstruct(block);
+        releaseReconstructionPayload(block);
+      });
       const tileBlocks = tile.decode();
-      reconstructAv1Frame(frame.planes, tileBlocks, sequence, header, bounds);
-      releaseReconstructionPayloads(tileBlocks);
       // Avoid turning every decoded block into a function argument. Large
       // still images can contain far more blocks than an engine's argument
       // count limit, and the explicit loops are cheaper as well.
@@ -158,22 +160,20 @@ export class Av1Decoder {
   }
 }
 
-function releaseReconstructionPayloads(blocks: Av1DecodedBlock[]): void {
-  for (const block of blocks) {
-    // Deblocking only needs transform positions for IntraBC luma blocks. All
-    // decoded coefficient values and every chroma unit have already been
-    // consumed by reconstruction at this point.
-    if (block.intrabc) {
-      for (const unit of block.yCoefficients) unit.result.coefficients = EMPTY_RECONSTRUCTION_PAYLOAD;
-    } else {
-      block.yCoefficients.length = 0;
-    }
-    block.uvCoefficients.length = 0;
-    block.yPalette = null;
-    block.uvPalette = null;
-    block.yPaletteIndices = null;
-    block.uvPaletteIndices = null;
+function releaseReconstructionPayload(block: Av1DecodedBlock): void {
+  // Deblocking only needs transform positions for IntraBC luma blocks. All
+  // decoded coefficient values and every chroma unit have already been
+  // consumed by reconstruction at this point.
+  if (block.intrabc) {
+    for (const unit of block.yCoefficients) unit.result.coefficients = EMPTY_RECONSTRUCTION_PAYLOAD;
+  } else {
+    block.yCoefficients.length = 0;
   }
+  block.uvCoefficients.length = 0;
+  block.yPalette = null;
+  block.uvPalette = null;
+  block.yPaletteIndices = null;
+  block.uvPaletteIndices = null;
 }
 
 function cloneFrame(source: DecodedFrame): DecodedFrame {
@@ -203,7 +203,19 @@ class TileDecoder {
   private readonly ssX: number;
   private readonly ssY: number;
   private readonly maxTransformChroma: readonly number[];
+  private readonly onBlock: (block: Av1DecodedBlock) => void;
   private readonly blocks: Av1DecodedBlock[] = [];
+  private readonly coefficientPools: Array<Int32Array[] | undefined> = [];
+  private readonly coefficientPoolPositions = new Uint16Array(1025);
+  private readonly coefficientPoolUsedLengths: number[] = [];
+  private readonly acquireCoefficients = (length: number): Int32Array => {
+    const position = this.coefficientPoolPositions[length]!;
+    if (!position) this.coefficientPoolUsedLengths.push(length);
+    const pool = this.coefficientPools[length] ?? (this.coefficientPools[length] = []);
+    const coefficients = pool[position] ?? (pool[position] = new Int32Array(length));
+    this.coefficientPoolPositions[length] = position + 1;
+    return coefficients;
+  };
   readonly restorationUnits: Av1RestorationUnit[] = [];
   private readonly restorationReferences = Array.from({ length: 3 }, () => ({
     filterVertical: [3, -7, 15] as [number, number, number],
@@ -250,7 +262,7 @@ class TileDecoder {
 
   constructor(
     sequence: Av1SequenceHeader, header: Av1FrameHeader, frame: DecodedFrame,
-    tileData: Uint8Array, bounds: TileBounds,
+    tileData: Uint8Array, bounds: TileBounds, onBlock: (block: Av1DecodedBlock) => void,
   ) {
     this.sequence = sequence;
     this.header = header;
@@ -265,6 +277,7 @@ class TileDecoder {
     this.width4 = Math.ceil(header.width / 4);
     this.height4 = Math.ceil(header.height / 4);
     this.bounds = bounds;
+    this.onBlock = onBlock;
     this.mapWidth4 = bounds.endX - bounds.startX;
     this.ssX = sequence.monochrome ? 0 : sequence.subsamplingX;
     this.ssY = sequence.monochrome ? 0 : sequence.subsamplingY;
@@ -396,6 +409,7 @@ class TileDecoder {
 
   private decodeBlock(level: number, blockSize: number, bx: number, by: number): void {
     if (bx >= this.bounds.endX || by >= this.bounds.endY) return;
+    this.resetCoefficientPool();
     const dimensions = block_dimensions[blockSize]!;
     const bw4 = dimensions[0]!, bh4 = dimensions[1]!;
     const w4 = Math.min(bw4, this.bounds.endX - bx), h4 = Math.min(bh4, this.bounds.endY - by);
@@ -577,6 +591,7 @@ class TileDecoder {
                 reducedTransformSet: this.header.reducedTransformSet, qIdx: blockQIdx,
                 lossless: this.header.segmentLossless[segmentId],
                 subsamplingX: this.ssX, subsamplingY: this.ssY,
+                acquireCoefficients: this.acquireCoefficients,
                 above: this.aboveLcoef.subarray(bx + x), left: this.leftLcoef.subarray(byLocal + y),
               });
               block.yCoefficients.push({ x4: bx + x, y4: by + y, tx, result });
@@ -601,6 +616,7 @@ class TileDecoder {
                   reducedTransformSet: this.header.reducedTransformSet, qIdx: blockQIdx,
                   lossless: this.header.segmentLossless[segmentId],
                   subsamplingX: this.ssX, subsamplingY: this.ssY,
+                  acquireCoefficients: this.acquireCoefficients,
                   above: this.aboveCcoef[plane].subarray(cbx + x),
                   left: this.leftCcoef[plane].subarray(cby + y),
                 });
@@ -619,6 +635,7 @@ class TileDecoder {
     }
 
     this.updateBlockContexts(block, bw4, bh4, hasChroma);
+    this.onBlock(block);
     this.blocks.push(block);
     void level;
   }
@@ -771,6 +788,7 @@ class TileDecoder {
           reducedTransformSet: this.header.reducedTransformSet, qIdx: blockQIdx,
           lossless: this.header.segmentLossless[segmentId],
           subsamplingX: this.ssX, subsamplingY: this.ssY,
+          acquireCoefficients: this.acquireCoefficients,
           above: this.aboveLcoef.subarray(leaf.x4), left: this.leftLcoef.subarray(leaf.y4 & 31),
         });
         block.yCoefficients.push({ x4: leaf.x4, y4: leaf.y4, tx: leaf.tx, result });
@@ -796,6 +814,7 @@ class TileDecoder {
                 lossless: this.header.segmentLossless[segmentId],
                 subsamplingX: this.ssX, subsamplingY: this.ssY,
                 lumaTxType: this.lumaTxType[this.mapIndex(lumaX, lumaY)]!,
+                acquireCoefficients: this.acquireCoefficients,
                 above: this.aboveCcoef[plane].subarray(cbx + x),
                 left: this.leftCcoef[plane].subarray(cby + y),
               });
@@ -813,7 +832,13 @@ class TileDecoder {
     }
 
     this.updateBlockContexts(block, bw4, bh4, hasChroma);
+    this.onBlock(block);
     this.blocks.push(block);
+  }
+
+  private resetCoefficientPool(): void {
+    for (const length of this.coefficientPoolUsedLengths) this.coefficientPoolPositions[length] = 0;
+    this.coefficientPoolUsedLengths.length = 0;
   }
 
   private readMvResidual(x: number, y: number): { x: number; y: number } {

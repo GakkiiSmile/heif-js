@@ -91,12 +91,13 @@ export interface ReconstructionBounds {
   startX: number; endX: number; startY: number; endY: number;
 }
 
-/** Reconstruct an intra-only AV1 still picture from its already decoded block syntax. */
-export function reconstructAv1Frame(
-  planes: Plane[], blocks: readonly Av1DecodedBlock[],
-  sequence: Av1SequenceHeader, header: Av1FrameHeader,
+export type Av1BlockReconstructor = (block: Av1DecodedBlock) => void;
+
+/** Create one tile-local reconstruction state and consume decoded blocks in bitstream order. */
+export function createAv1BlockReconstructor(
+  planes: Plane[], sequence: Av1SequenceHeader, header: Av1FrameHeader,
   bounds?: ReconstructionBounds,
-): void {
+): Av1BlockReconstructor {
   const context: ReconstructionContext = {
     sequence, header, planes,
     masks: planes.map((plane, index) => createReconstructionMask(plane, sequence, index, bounds)),
@@ -104,7 +105,17 @@ export function reconstructAv1Frame(
     max: (1 << sequence.bitDepth) - 1,
     scratch: createReconstructionScratch(),
   };
-  for (const block of blocks) reconstructBlock(context, block);
+  return block => reconstructBlock(context, block);
+}
+
+/** Reconstruct an intra-only AV1 still picture from its already decoded block syntax. */
+export function reconstructAv1Frame(
+  planes: Plane[], blocks: readonly Av1DecodedBlock[],
+  sequence: Av1SequenceHeader, header: Av1FrameHeader,
+  bounds?: ReconstructionBounds,
+): void {
+  const reconstruct = createAv1BlockReconstructor(planes, sequence, header, bounds);
+  for (const block of blocks) reconstruct(block);
 }
 
 function createReconstructionMask(

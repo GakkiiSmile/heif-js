@@ -323,6 +323,28 @@ for (let y = 0; y < crop.height; y++) {
 }
 console.log('ok scalar colour path: shared chroma sampling, alpha channel, source crop');
 
+// The 8-bit co-sited 4:2:0 loop is specialized, while the equivalent 10-bit
+// frame follows the scalar path. Limited-range codes scaled by four describe
+// exactly the same samples, so the two paths must remain byte-identical.
+const coSited10 = new DecodedFrame(fastColourFrame.width, fastColourFrame.height, 10, CHROMA_420);
+for (let plane = 0; plane < fastColourFrame.planes.length; plane++) {
+  const source = fastColourFrame.planes[plane]!.data;
+  const destination = coSited10.planes[plane]!.data;
+  for (let index = 0; index < source.length; index++) destination[index] = source[index]! << 2;
+}
+const coSitedCrop = { left: 2, top: 2, width: 11, height: 9 };
+const coSited8Rgba = frameToRgba(fastColourFrame, 6, false, 2, 2, 1, null, true, coSitedCrop);
+assert.deepEqual(coSited8Rgba, frameToRgba(coSited10, 6, false, 2, 2, 1, null, true, coSitedCrop));
+assert.deepEqual(
+  frameToAlpha(fastColourFrame, 6, false, 2, 2, 1, coSitedCrop),
+  frameToAlpha(coSited10, 6, false, 2, 2, 1, coSitedCrop),
+);
+assert.deepEqual(
+  frameToRgba(fastColourFrame, 6, false, 1, 13, 1, null, true, coSitedCrop),
+  frameToRgba(fastColourFrame, 6, false, 1, 13, 1, null, false, coSitedCrop),
+);
+console.log('ok co-sited 4:2:0 fast path + exact sRGB NCLX identity');
+
 const avifCases = [
   ['avif_a_8', 320, 240, 35],
   ['avif_a_cdef', 320, 240, 40],

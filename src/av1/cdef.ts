@@ -63,6 +63,7 @@ export function applyCdef(
     frame.planes.map((plane, index) =>
       (index === 0 ? filterLuma : filterChroma) ? copyPlane(plane) : plane);
   const directionScratch = createDirectionScratch();
+  const constrainCache = new Map<number, Int16Array>();
   const bitDepthShift = sequence.bitDepth - 8;
   const damping = header.cdefDamping + bitDepthShift;
   const ssX = sequence.subsamplingX, ssY = sequence.subsamplingY;
@@ -84,7 +85,7 @@ export function applyCdef(
       const ySecondary = (ySecondaryCode + +(ySecondaryCode === 3)) << bitDepthShift;
       if (yPrimary || ySecondary) {
         filterBlock(sources[0]!, frame.planes[0]!, x, y, 8, 8,
-          yPrimary, ySecondary, direction, damping, bitDepthShift);
+          yPrimary, ySecondary, direction, damping, bitDepthShift, constrainCache);
       }
 
       if (!uvLevel || frame.planes.length === 1) continue;
@@ -95,7 +96,8 @@ export function applyCdef(
       const uvX = x >> ssX, uvY = y >> ssY;
       for (let plane = 1; plane <= 2; plane++) {
         filterBlock(sources[plane]!, frame.planes[plane]!, uvX, uvY,
-          8 >> ssX, 8 >> ssY, uvPrimary, uvSecondary, uvDirection, damping - 1, bitDepthShift);
+          8 >> ssX, 8 >> ssY, uvPrimary, uvSecondary, uvDirection, damping - 1, bitDepthShift,
+          constrainCache);
       }
     }
   }
@@ -170,6 +172,7 @@ function adjustStrength(strength: number, variance: number): number {
 function filterBlock(
   source: Plane, destination: Plane, x0: number, y0: number, nominalWidth: number, nominalHeight: number,
   primaryStrength: number, secondaryStrength: number, direction: number, damping: number, bitDepthShift: number,
+  constrainCache: Map<number, Int16Array>,
 ): void {
   const width = Math.min(nominalWidth, destination.width - x0);
   const height = Math.min(nominalHeight, destination.height - y0);
@@ -177,12 +180,18 @@ function filterBlock(
   const primaryShift = primaryStrength ? Math.max(0, damping - floorLog2(primaryStrength)) : 0;
   const secondaryShift = secondaryStrength ? Math.max(0, damping - floorLog2(secondaryStrength)) : 0;
   const primaryTap0 = 4 - ((primaryStrength >> bitDepthShift) & 1);
+  const differenceOffset = (1 << (bitDepthShift + 8)) - 1;
+  const primaryLookup = primaryStrength
+    ? constrainLookup(constrainCache, primaryStrength, primaryShift, bitDepthShift) : null;
+  const secondaryLookup = secondaryStrength
+    ? constrainLookup(constrainCache, secondaryStrength, secondaryShift, bitDepthShift) : null;
   // Every CDEF displacement is at most two samples. Most 8x8 blocks have that
   // margin, so their inner loop can use precomputed linear offsets and avoid
   // twelve bounds-checked helper calls per pixel.
   if (x0 >= 2 && y0 >= 2 && x0 + width + 1 < source.width && y0 + height + 1 < source.height) {
     filterInteriorBlock(source, destination, x0, y0, width, height,
-      primaryStrength, secondaryStrength, direction, primaryShift, secondaryShift, primaryTap0);
+      primaryStrength, secondaryStrength, direction, primaryTap0,
+      primaryLookup, secondaryLookup, differenceOffset);
     return;
   }
   for (let y = 0; y < height; y++) {
@@ -195,13 +204,13 @@ function filterBlock(
           const [dx, dy] = DIRECTIONS[direction + 2]![pass]!;
           const negative = cdefSample(source, x0 + x - dx, y0 + y - dy);
           if (negative !== null) {
-            sum += tap * constrain(negative - center, primaryStrength, primaryShift);
+            sum += tap * primaryLookup![negative - center + differenceOffset]!;
             minimum = Math.min(minimum, negative);
             maximum = Math.max(maximum, negative);
           }
           const positive = cdefSample(source, x0 + x + dx, y0 + y + dy);
           if (positive !== null) {
-            sum += tap * constrain(positive - center, primaryStrength, primaryShift);
+            sum += tap * primaryLookup![positive - center + differenceOffset]!;
             minimum = Math.min(minimum, positive);
             maximum = Math.max(maximum, positive);
           }
@@ -215,13 +224,13 @@ function filterBlock(
             const [dx, dy] = DIRECTIONS[direction + directionOffset]![pass]!;
             const negative = cdefSample(source, x0 + x - dx, y0 + y - dy);
             if (negative !== null) {
-              sum += tap * constrain(negative - center, secondaryStrength, secondaryShift);
+              sum += tap * secondaryLookup![negative - center + differenceOffset]!;
               minimum = Math.min(minimum, negative);
               maximum = Math.max(maximum, negative);
             }
             const positive = cdefSample(source, x0 + x + dx, y0 + y + dy);
             if (positive !== null) {
-              sum += tap * constrain(positive - center, secondaryStrength, secondaryShift);
+              sum += tap * secondaryLookup![positive - center + differenceOffset]!;
               minimum = Math.min(minimum, positive);
               maximum = Math.max(maximum, positive);
             }
@@ -238,7 +247,8 @@ function filterBlock(
 function filterInteriorBlock(
   source: Plane, destination: Plane, x0: number, y0: number, width: number, height: number,
   primaryStrength: number, secondaryStrength: number, direction: number,
-  primaryShift: number, secondaryShift: number, primaryTap0: number,
+  primaryTap0: number, primaryLookup: Int16Array | null, secondaryLookup: Int16Array | null,
+  differenceOffset: number,
 ): void {
   const sourceData = source.data, destinationData = destination.data;
   const sourceStride = source.stride, destinationStride = destination.stride;
@@ -255,14 +265,14 @@ function filterInteriorBlock(
   if (!secondaryStrength) {
     filterInteriorPrimary(
       sourceData, destinationData, sourceStride, destinationStride, x0, y0, width, height,
-      primaryStrength, primaryShift, primaryTap0, primaryTap1, primaryOffset0, primaryOffset1,
+      primaryLookup!, differenceOffset, primaryTap0, primaryTap1, primaryOffset0, primaryOffset1,
     );
     return;
   }
   if (!primaryStrength) {
     filterInteriorSecondary(
       sourceData, destinationData, sourceStride, destinationStride, x0, y0, width, height,
-      secondaryStrength, secondaryShift,
+      secondaryLookup!, differenceOffset,
       secondaryOffset00, secondaryOffset01, secondaryOffset10, secondaryOffset11,
     );
     return;
@@ -273,47 +283,48 @@ function filterInteriorBlock(
     let destinationIndex = (y0 + y) * destinationStride + x0;
     for (let x = 0; x < width; x++, sourceIndex++, destinationIndex++) {
       const center = sourceData[sourceIndex]!;
+      const lookupOffset = differenceOffset - center;
       let sum = 0, minimum = center, maximum = center;
       let negative: number, positive: number;
       negative = sourceData[sourceIndex - primaryOffset0]!;
       positive = sourceData[sourceIndex + primaryOffset0]!;
-      sum += primaryTap0 * constrain(negative - center, primaryStrength, primaryShift);
-      sum += primaryTap0 * constrain(positive - center, primaryStrength, primaryShift);
+      sum += primaryTap0 * primaryLookup![negative + lookupOffset]!;
+      sum += primaryTap0 * primaryLookup![positive + lookupOffset]!;
       minimum = Math.min(minimum, negative, positive);
       maximum = Math.max(maximum, negative, positive);
 
       negative = sourceData[sourceIndex - primaryOffset1]!;
       positive = sourceData[sourceIndex + primaryOffset1]!;
-      sum += primaryTap1 * constrain(negative - center, primaryStrength, primaryShift);
-      sum += primaryTap1 * constrain(positive - center, primaryStrength, primaryShift);
+      sum += primaryTap1 * primaryLookup![negative + lookupOffset]!;
+      sum += primaryTap1 * primaryLookup![positive + lookupOffset]!;
       minimum = Math.min(minimum, negative, positive);
       maximum = Math.max(maximum, negative, positive);
 
       negative = sourceData[sourceIndex - secondaryOffset00]!;
       positive = sourceData[sourceIndex + secondaryOffset00]!;
-      sum += 2 * constrain(negative - center, secondaryStrength, secondaryShift);
-      sum += 2 * constrain(positive - center, secondaryStrength, secondaryShift);
+      sum += 2 * secondaryLookup![negative + lookupOffset]!;
+      sum += 2 * secondaryLookup![positive + lookupOffset]!;
       minimum = Math.min(minimum, negative, positive);
       maximum = Math.max(maximum, negative, positive);
 
       negative = sourceData[sourceIndex - secondaryOffset01]!;
       positive = sourceData[sourceIndex + secondaryOffset01]!;
-      sum += 2 * constrain(negative - center, secondaryStrength, secondaryShift);
-      sum += 2 * constrain(positive - center, secondaryStrength, secondaryShift);
+      sum += 2 * secondaryLookup![negative + lookupOffset]!;
+      sum += 2 * secondaryLookup![positive + lookupOffset]!;
       minimum = Math.min(minimum, negative, positive);
       maximum = Math.max(maximum, negative, positive);
 
       negative = sourceData[sourceIndex - secondaryOffset10]!;
       positive = sourceData[sourceIndex + secondaryOffset10]!;
-      sum += constrain(negative - center, secondaryStrength, secondaryShift);
-      sum += constrain(positive - center, secondaryStrength, secondaryShift);
+      sum += secondaryLookup![negative + lookupOffset]!;
+      sum += secondaryLookup![positive + lookupOffset]!;
       minimum = Math.min(minimum, negative, positive);
       maximum = Math.max(maximum, negative, positive);
 
       negative = sourceData[sourceIndex - secondaryOffset11]!;
       positive = sourceData[sourceIndex + secondaryOffset11]!;
-      sum += constrain(negative - center, secondaryStrength, secondaryShift);
-      sum += constrain(positive - center, secondaryStrength, secondaryShift);
+      sum += secondaryLookup![negative + lookupOffset]!;
+      sum += secondaryLookup![positive + lookupOffset]!;
       minimum = Math.min(minimum, negative, positive);
       maximum = Math.max(maximum, negative, positive);
       let value = center + ((sum - +(sum < 0) + 8) >> 4);
@@ -326,18 +337,20 @@ function filterInteriorBlock(
 function filterInteriorPrimary(
   source: Plane['data'], destination: Plane['data'], sourceStride: number, destinationStride: number,
   x0: number, y0: number, width: number, height: number,
-  strength: number, shift: number, tap0: number, tap1: number, offset0: number, offset1: number,
+  lookup: Int16Array, differenceOffset: number,
+  tap0: number, tap1: number, offset0: number, offset1: number,
 ): void {
   for (let y = 0; y < height; y++) {
     let sourceIndex = (y0 + y) * sourceStride + x0;
     let destinationIndex = (y0 + y) * destinationStride + x0;
     for (let x = 0; x < width; x++, sourceIndex++, destinationIndex++) {
       const center = source[sourceIndex]!;
+      const lookupOffset = differenceOffset - center;
       let sum = 0;
-      sum += tap0 * constrain(source[sourceIndex - offset0]! - center, strength, shift);
-      sum += tap0 * constrain(source[sourceIndex + offset0]! - center, strength, shift);
-      sum += tap1 * constrain(source[sourceIndex - offset1]! - center, strength, shift);
-      sum += tap1 * constrain(source[sourceIndex + offset1]! - center, strength, shift);
+      sum += tap0 * lookup[source[sourceIndex - offset0]! + lookupOffset]!;
+      sum += tap0 * lookup[source[sourceIndex + offset0]! + lookupOffset]!;
+      sum += tap1 * lookup[source[sourceIndex - offset1]! + lookupOffset]!;
+      sum += tap1 * lookup[source[sourceIndex + offset1]! + lookupOffset]!;
       destination[destinationIndex] = center + ((sum - +(sum < 0) + 8) >> 4);
     }
   }
@@ -345,7 +358,8 @@ function filterInteriorPrimary(
 
 function filterInteriorSecondary(
   source: Plane['data'], destination: Plane['data'], sourceStride: number, destinationStride: number,
-  x0: number, y0: number, width: number, height: number, strength: number, shift: number,
+  x0: number, y0: number, width: number, height: number,
+  lookup: Int16Array, differenceOffset: number,
   offset00: number, offset01: number, offset10: number, offset11: number,
 ): void {
   for (let y = 0; y < height; y++) {
@@ -353,15 +367,16 @@ function filterInteriorSecondary(
     let destinationIndex = (y0 + y) * destinationStride + x0;
     for (let x = 0; x < width; x++, sourceIndex++, destinationIndex++) {
       const center = source[sourceIndex]!;
+      const lookupOffset = differenceOffset - center;
       let sum = 0;
-      sum += 2 * constrain(source[sourceIndex - offset00]! - center, strength, shift);
-      sum += 2 * constrain(source[sourceIndex + offset00]! - center, strength, shift);
-      sum += 2 * constrain(source[sourceIndex - offset01]! - center, strength, shift);
-      sum += 2 * constrain(source[sourceIndex + offset01]! - center, strength, shift);
-      sum += constrain(source[sourceIndex - offset10]! - center, strength, shift);
-      sum += constrain(source[sourceIndex + offset10]! - center, strength, shift);
-      sum += constrain(source[sourceIndex - offset11]! - center, strength, shift);
-      sum += constrain(source[sourceIndex + offset11]! - center, strength, shift);
+      sum += 2 * lookup[source[sourceIndex - offset00]! + lookupOffset]!;
+      sum += 2 * lookup[source[sourceIndex + offset00]! + lookupOffset]!;
+      sum += 2 * lookup[source[sourceIndex - offset01]! + lookupOffset]!;
+      sum += 2 * lookup[source[sourceIndex + offset01]! + lookupOffset]!;
+      sum += lookup[source[sourceIndex - offset10]! + lookupOffset]!;
+      sum += lookup[source[sourceIndex + offset10]! + lookupOffset]!;
+      sum += lookup[source[sourceIndex - offset11]! + lookupOffset]!;
+      sum += lookup[source[sourceIndex + offset11]! + lookupOffset]!;
       destination[destinationIndex] = center + ((sum - +(sum < 0) + 8) >> 4);
     }
   }
@@ -376,6 +391,21 @@ function constrain(difference: number, threshold: number, shift: number): number
   const magnitude = Math.abs(difference);
   const constrained = Math.min(magnitude, Math.max(0, threshold - (magnitude >> shift)));
   return difference < 0 ? -constrained : constrained;
+}
+
+function constrainLookup(
+  cache: Map<number, Int16Array>, threshold: number, shift: number, bitDepthShift: number,
+): Int16Array {
+  const key = threshold | (shift << 8) | (bitDepthShift << 12);
+  let lookup = cache.get(key);
+  if (lookup) return lookup;
+  const maximum = (1 << (bitDepthShift + 8)) - 1;
+  lookup = new Int16Array(maximum * 2 + 1);
+  for (let difference = -maximum; difference <= maximum; difference++) {
+    lookup[difference + maximum] = constrain(difference, threshold, shift);
+  }
+  cache.set(key, lookup);
+  return lookup;
 }
 
 function floorLog2(value: number): number {

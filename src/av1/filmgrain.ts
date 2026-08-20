@@ -12,6 +12,28 @@ const FILM_GRAIN_SCRATCH = {
   previousOffsets: new Uint8Array(0),
 };
 
+interface GrainApplicationContext {
+  planeData: SampleArray;
+  sourcePlane: SampleArray;
+  sourceLuma: SampleArray;
+  planeStride: number;
+  lumaStride: number;
+  lumaWidth: number;
+  grain: Int16Array;
+  scaling: Uint8Array;
+  grainCenter: number;
+  scalingShift: number;
+  minimum: number;
+  maximum: number;
+  maxScalingIndex: number;
+  subX: number;
+  subY: number;
+  chromaFromLuma: boolean;
+  uvLumaMult: number;
+  uvMult: number;
+  uvOffset: number;
+}
+
 /** Synthesize AV1 film grain over the fully filtered output frame. */
 export function applyFilmGrain(
   frame: DecodedFrame, data: Av1FilmGrain | null, sequence: Av1SequenceHeader,
@@ -152,6 +174,13 @@ function applyPlaneGrain(
   const uvMult = chroma ? data.uvMult[uv]! : 0;
   const uvOffset = chroma ? data.uvOffset[uv]! << bitDepthShift : 0;
   const maxScalingIndex = (1 << sequence.bitDepth) - 1;
+  const application: GrainApplicationContext = {
+    planeData: plane.data, sourcePlane, sourceLuma,
+    planeStride: plane.stride, lumaStride: luma.stride, lumaWidth: luma.width,
+    grain, scaling, grainCenter, scalingShift: data.scalingShift,
+    minimum, maximum, maxScalingIndex, subX, subY, chromaFromLuma,
+    uvLumaMult, uvMult, uvOffset,
+  };
 
   for (let blockRow = 0; blockRow < blockRows; blockRow++) {
     const swap = previousOffsets; previousOffsets = currentOffsets; currentOffsets = swap;
@@ -188,48 +217,103 @@ function applyPlaneGrain(
             3 + grainStepX * (3 + (topLeftRandom >> 4)) + blockWidth;
         }
       }
-      for (let y = 0; y < height; y++) {
-        const grainRow = y * GRAIN_WIDTH;
-        const planeRow = (y0 + y) * plane.stride + x0;
-        const lumaY = (y0 + y) << subY;
-        const lumaRow = lumaY * luma.stride;
-        const topOverlap = y < overlapY;
-        for (let x = 0; x < width; x++) {
-          let value = grain[currentBase + grainRow + x]!;
-          if (x < overlapX) {
-            const old = grain[leftBase + grainRow + x]!;
-            value = blend(old, value, subX, x);
-          }
-          if (topOverlap) {
-            let top = grain[topBase + grainRow + x]!;
-            if (x < overlapX) {
-              const topLeft = grain[topLeftBase + grainRow + x]!;
-              top = blend(topLeft, top, subX, x);
-            }
-            value = blend(top, value, subY, y);
-          }
-          value = value < -grainCenter ? -grainCenter : value >= grainCenter ? grainCenter - 1 : value;
+      if (chroma) {
+        applyChromaGrainBlock(application, x0, y0, width, height, overlapX, overlapY,
+          currentBase, leftBase, topBase, topLeftBase);
+      } else {
+        applyLumaGrainBlock(application, x0, y0, width, height, overlapX, overlapY,
+          currentBase, leftBase, topBase, topLeftBase);
+      }
+    }
+  }
+}
 
-          const globalX = x0 + x;
-          const sourceValue = sourcePlane[planeRow + x]!;
-          let scalingIndex = sourceValue;
-          if (chroma) {
-            const lumaX = globalX << subX;
-            let average = sourceLuma[lumaRow + lumaX]!;
-            if (subX) {
-              const adjacentX = lumaX + 1 < luma.width ? lumaX + 1 : lumaX;
-              average = (average + sourceLuma[lumaRow + adjacentX]! + 1) >> 1;
-            }
-            if (chromaFromLuma) scalingIndex = average;
-            else {
-              const combined = ((average * uvLumaMult + sourceValue * uvMult) >> 6) + uvOffset;
-              scalingIndex = combined < 0 ? 0 : combined > maxScalingIndex ? maxScalingIndex : combined;
-            }
-          }
-          const noise = round2(scaling[scalingIndex]! * value, data.scalingShift);
-          const output = sourceValue + noise;
-          plane.data[planeRow + x] = output < minimum ? minimum : output > maximum ? maximum : output;
+function applyLumaGrainBlock(
+  context: GrainApplicationContext,
+  x0: number, y0: number, width: number, height: number,
+  overlapX: number, overlapY: number,
+  currentBase: number, leftBase: number, topBase: number, topLeftBase: number,
+): void {
+  const { planeData, sourcePlane, planeStride, grain, scaling,
+    grainCenter, scalingShift, minimum, maximum } = context;
+  for (let y = 0; y < height; y++) {
+    const grainRow = y * GRAIN_WIDTH;
+    const planeRow = (y0 + y) * planeStride + x0;
+    const topOverlap = y < overlapY;
+    for (let x = 0; x < width; x++) {
+      let value = grain[currentBase + grainRow + x]!;
+      if (x < overlapX) value = blend(grain[leftBase + grainRow + x]!, value, 0, x);
+      if (topOverlap) {
+        let top = grain[topBase + grainRow + x]!;
+        if (x < overlapX) top = blend(grain[topLeftBase + grainRow + x]!, top, 0, x);
+        value = blend(top, value, 0, y);
+      }
+      value = value < -grainCenter ? -grainCenter : value >= grainCenter ? grainCenter - 1 : value;
+      const sourceValue = sourcePlane[planeRow + x]!;
+      const noise = round2(scaling[sourceValue]! * value, scalingShift);
+      const output = sourceValue + noise;
+      planeData[planeRow + x] = output < minimum ? minimum : output > maximum ? maximum : output;
+    }
+  }
+}
+
+function applyChromaGrainBlock(
+  context: GrainApplicationContext,
+  x0: number, y0: number, width: number, height: number,
+  overlapX: number, overlapY: number,
+  currentBase: number, leftBase: number, topBase: number, topLeftBase: number,
+): void {
+  const { planeData, sourcePlane, sourceLuma, planeStride, lumaStride, lumaWidth,
+    grain, scaling, grainCenter, scalingShift, minimum, maximum, maxScalingIndex,
+    subX, subY, chromaFromLuma, uvLumaMult, uvMult, uvOffset } = context;
+  for (let y = 0; y < height; y++) {
+    const grainRow = y * GRAIN_WIDTH;
+    const planeRow = (y0 + y) * planeStride + x0;
+    const lumaRow = ((y0 + y) << subY) * lumaStride;
+    const topOverlap = y < overlapY;
+    if (chromaFromLuma) {
+      for (let x = 0; x < width; x++) {
+        let value = grain[currentBase + grainRow + x]!;
+        if (x < overlapX) value = blend(grain[leftBase + grainRow + x]!, value, subX, x);
+        if (topOverlap) {
+          let top = grain[topBase + grainRow + x]!;
+          if (x < overlapX) top = blend(grain[topLeftBase + grainRow + x]!, top, subX, x);
+          value = blend(top, value, subY, y);
         }
+        value = value < -grainCenter ? -grainCenter : value >= grainCenter ? grainCenter - 1 : value;
+        const lumaX = (x0 + x) << subX;
+        let average = sourceLuma[lumaRow + lumaX]!;
+        if (subX) {
+          const adjacentX = lumaX + 1 < lumaWidth ? lumaX + 1 : lumaX;
+          average = (average + sourceLuma[lumaRow + adjacentX]! + 1) >> 1;
+        }
+        const sourceValue = sourcePlane[planeRow + x]!;
+        const noise = round2(scaling[average]! * value, scalingShift);
+        const output = sourceValue + noise;
+        planeData[planeRow + x] = output < minimum ? minimum : output > maximum ? maximum : output;
+      }
+    } else {
+      for (let x = 0; x < width; x++) {
+        let value = grain[currentBase + grainRow + x]!;
+        if (x < overlapX) value = blend(grain[leftBase + grainRow + x]!, value, subX, x);
+        if (topOverlap) {
+          let top = grain[topBase + grainRow + x]!;
+          if (x < overlapX) top = blend(grain[topLeftBase + grainRow + x]!, top, subX, x);
+          value = blend(top, value, subY, y);
+        }
+        value = value < -grainCenter ? -grainCenter : value >= grainCenter ? grainCenter - 1 : value;
+        const lumaX = (x0 + x) << subX;
+        let average = sourceLuma[lumaRow + lumaX]!;
+        if (subX) {
+          const adjacentX = lumaX + 1 < lumaWidth ? lumaX + 1 : lumaX;
+          average = (average + sourceLuma[lumaRow + adjacentX]! + 1) >> 1;
+        }
+        const sourceValue = sourcePlane[planeRow + x]!;
+        const combined = ((average * uvLumaMult + sourceValue * uvMult) >> 6) + uvOffset;
+        const scalingIndex = combined < 0 ? 0 : combined > maxScalingIndex ? maxScalingIndex : combined;
+        const noise = round2(scaling[scalingIndex]! * value, scalingShift);
+        const output = sourceValue + noise;
+        planeData[planeRow + x] = output < minimum ? minimum : output > maximum ? maximum : output;
       }
     }
   }
