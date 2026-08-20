@@ -210,7 +210,8 @@ function findCacheableItems(file: HeifFile): Set<number> {
   const incoming = new Map<number, number>();
   incoming.set(file.primaryItemId, 1);
   for (const item of file.items.values()) {
-    for (const ids of Object.values(item.references)) {
+    for (const type of Object.keys(item.references)) {
+      const ids = item.references[type]!;
       for (const id of ids) incoming.set(id, (incoming.get(id) ?? 0) + 1);
     }
   }
@@ -390,8 +391,10 @@ function attachAuxiliaryAlpha(
 ): { image: DecodedItemImage; mutable: boolean; attached: boolean } {
   let alphaItem: ImageItem | undefined;
   for (const candidate of file.items.values()) {
-    const pointsToItem = candidate.references.auxl?.includes(item.itemId);
-    const itemPointsToCandidate = item.references.auxl?.includes(candidate.itemId);
+    const candidateAuxiliary = candidate.references.auxl;
+    const itemAuxiliary = item.references.auxl;
+    const pointsToItem = candidateAuxiliary !== undefined && candidateAuxiliary.indexOf(item.itemId) >= 0;
+    const itemPointsToCandidate = itemAuxiliary !== undefined && itemAuxiliary.indexOf(candidate.itemId) >= 0;
     if ((pointsToItem || itemPointsToCandidate) &&
         (!candidate.auxType || /alpha|auxid:1/i.test(candidate.auxType))) {
       alphaItem = candidate;

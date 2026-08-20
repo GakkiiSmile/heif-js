@@ -88,7 +88,10 @@ const LPS_TABLE_ROWS: readonly (readonly number[])[] = [
   [6, 7, 8, 9],
   [2, 2, 2, 2],
 ];
-const LPS_TABLE = LPS_TABLE_ROWS.flat();
+const LPS_TABLE: number[] = [];
+for (const row of LPS_TABLE_ROWS) {
+  for (const value of row) LPS_TABLE.push(value);
+}
 
 
 const NEXT_MPS = [

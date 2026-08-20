@@ -7,7 +7,7 @@ import {
   parseFrameHeader, parseObus, parseSequenceHeader, parseTileGroup,
   OBU_FRAME, OBU_FRAME_HEADER, OBU_SEQUENCE_HEADER, OBU_TILE_GROUP,
 } from './obu.ts';
-import type { Av1FrameHeader, Av1SequenceHeader } from './obu.ts';
+import type { Av1FrameHeader, Av1SequenceHeader, Av1TileData } from './obu.ts';
 import { createAv1BlockReconstructor, upscaleAv1Frame } from './reconstruct.ts';
 import { applyCdef } from './cdef.ts';
 import { applyDeblock } from './deblock.ts';
@@ -97,7 +97,10 @@ export class Av1Decoder {
     const tileGroupPayloads = frameObu ? [header.tileData] :
       obus.filter(obu => obu.type === OBU_TILE_GROUP).map(obu => obu.payload);
     if (!tileGroupPayloads.length) throw new Error('AV1: tile group is missing');
-    const tilePayloads = tileGroupPayloads.flatMap(payload => parseTileGroup(payload, header));
+    const tilePayloads: Av1TileData[] = [];
+    for (const payload of tileGroupPayloads) {
+      for (const tile of parseTileGroup(payload, header)) tilePayloads.push(tile);
+    }
     const tileCount = header.tileCols * header.tileRows;
     if (tilePayloads.length !== tileCount || tilePayloads.some((tile, index) => tile.index !== index)) {
       throw new Error('AV1: tile groups do not cover the frame in order');
@@ -1378,7 +1381,7 @@ function mergeSorted(first: number[], second: number[]): number[] {
 function paletteOrder(indices: Uint8Array, stride: number, x: number, y: number): { context: number; order: number[] } {
   const order: number[] = [];
   let context = 0;
-  const add = (value: number) => { if (!order.includes(value)) order.push(value); };
+  const add = (value: number) => { if (order.indexOf(value) < 0) order.push(value); };
   if (x === 0) add(indices[(y - 1) * stride + x]!);
   else if (y === 0) add(indices[y * stride + x - 1]!);
   else {

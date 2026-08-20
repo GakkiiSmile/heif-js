@@ -2,7 +2,8 @@
 
 纯 TypeScript 的静态 HEIC、HEIF 与 AVIF 解码器。输入 `ArrayBuffer` 或任意
 TypedArray/DataView，直接得到包含 RGBA8 像素的 `DecodedImage`。不依赖 WASM、
-原生模块、WebCodecs，也不借用浏览器内置的 HEIF/AVIF 解码能力。
+原生模块、DOM、WebCodecs，也不借用浏览器内置的 HEIF/AVIF 解码能力；发布的
+类型声明同样不要求 TypeScript 的 `lib.dom`。
 
 ## 使用
 
@@ -100,12 +101,30 @@ const image = decode(binary, {
 图片 item 中的 HEVC 使用 I-slice，AV1 使用 key/intra frame；这是本项目静态解码器
 与完整视频解码器的边界。
 
+## 构建产物
+
+`npm run build` 使用 Rspack 生成多种模块格式：
+
+- `dist/esm/`：供 `import` 使用的 ESM，保留源码模块结构；
+- `dist/cjs/`：供 Node.js `require()` 使用的 CommonJS；
+- `dist/browser/heif-js.amd.js`：具名 AMD 包；
+- `dist/browser/heif-js.umd.js`：暴露全局变量 `HeifJS` 的 UMD 包；
+- `dist/types/`：由 TypeScript 生成的声明文件。
+
+JavaScript 产物以 ES2015（ES6）为语法和运行时 API 基线，不依赖 ES2016+
+内置方法或 `TextDecoder`。
+
+发布产物支持 Node.js 16 及以上版本；运行 Rspack 2 构建流程需要 Node.js
+20.19+ 或 22.12+。
+
 ## 开发验证
 
 ```sh
 npm install
 npm run build
+npm run test:types
 npm test
+npm run test:package
 npm run test:fuzz
 npm run bench
 npm run bench:entries

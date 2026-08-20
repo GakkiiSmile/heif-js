@@ -4,7 +4,9 @@ interface DebugProcess {
   stderr?: { write(text: string): unknown };
 }
 
-const debugProcess = (globalThis as typeof globalThis & { process?: DebugProcess }).process;
+declare const process: DebugProcess | undefined;
+
+const debugProcess = typeof process === 'undefined' ? undefined : process;
 
 export function debugEnabled(name: string): boolean {
   return Boolean(debugProcess?.env?.[name]);

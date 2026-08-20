@@ -740,7 +740,7 @@ class SliceDecoder {
       }
     }
 
-    let startStream = streams.findIndex(s => s.ctbs.includes(h.address));
+    let startStream = streams.findIndex(stream => stream.ctbs.indexOf(h.address) >= 0);
     if (startStream < 0) throw new Error(`HEVC: invalid slice_segment_address ${h.address}`);
     const inheritedContexts = h.dependent ? this.cabac.saveContexts() : null;
     const wavefrontContexts = new Map<number, { states: Uint8Array; mps: Uint8Array }>();

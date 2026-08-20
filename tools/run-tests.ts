@@ -230,6 +230,15 @@ for (const [name, type, width, height, checksum] of [
   assert.deepEqual(decodedInto.data, decoded.data);
   if (name === 'grid') assert.equal(file.primary.references.dimg?.length, 6);
   if (name === 'prem') {
+    const auxiliary = [...file.items.values()].find(item => item.auxType);
+    assert.equal(auxiliary?.auxType, 'urn:mpeg:hevc:2015:auxid:1');
+    const utf8Encoded = new Uint8Array(encoded);
+    const auxiliaryOffset = findAscii(utf8Encoded, 'urn:mpeg:hevc:2015:auxid:1');
+    assert.ok(auxiliaryOffset >= 0, 'premultiplied-alpha fixture lost its auxC type string');
+    utf8Encoded[auxiliaryOffset] = 0xc3;
+    utf8Encoded[auxiliaryOffset + 1] = 0xa9;
+    const utf8Auxiliary = [...new HeifFile().parse(utf8Encoded).items.values()].find(item => item.auxType);
+    assert.equal(utf8Auxiliary?.auxType, 'én:mpeg:hevc:2015:auxid:1');
     let transparent = 0;
     for (let offset = 3; offset < decoded.data.length; offset += 4) transparent += +(decoded.data[offset] !== 255);
     assert.ok(transparent > 0, 'premultiplied-alpha fixture lost its auxiliary alpha plane');

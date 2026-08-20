@@ -2,25 +2,55 @@
   "name": "heif-js",
   "version": "0.1.0",
   "description": "Pure TypeScript HEIC/HEIF/AVIF decoder (input: binary, output: RGBA8 pixels)",
+  "keywords": [
+    "heic",
+    "heif",
+    "avif",
+    "hevc",
+    "av1",
+    "image-decoder",
+    "typescript",
+    "pure-javascript"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=16"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GakkiiSmile/heif-js.git"
+  },
+  "homepage": "https://github.com/GakkiiSmile/heif-js#readme",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/cjs/index.cjs",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/types/index.d.ts",
+  "unpkg": "./dist/browser/heif-js.umd.js",
+  "jsdelivr": "./dist/browser/heif-js.umd.js",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.cjs",
+      "default": "./dist/esm/index.js"
     },
     "./detect": {
-      "types": "./dist/detect.d.ts",
-      "import": "./dist/detect.js"
+      "types": "./dist/types/detect.d.ts",
+      "import": "./dist/esm/detect.js",
+      "require": "./dist/cjs/detect.cjs",
+      "default": "./dist/esm/detect.js"
     },
     "./heic": {
-      "types": "./dist/heic.d.ts",
-      "import": "./dist/heic.js"
+      "types": "./dist/types/heic.d.ts",
+      "import": "./dist/esm/heic.js",
+      "require": "./dist/cjs/heic.cjs",
+      "default": "./dist/esm/heic.js"
     },
     "./avif": {
-      "types": "./dist/avif.d.ts",
-      "import": "./dist/avif.js"
+      "types": "./dist/types/avif.d.ts",
+      "import": "./dist/esm/avif.js",
+      "require": "./dist/cjs/avif.cjs",
+      "default": "./dist/esm/avif.js"
     }
   },
   "files": [
@@ -28,13 +58,21 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsc && node tools/fix-declarations.mjs",
+    "clean": "node tools/clean-dist.mjs",
+    "build:types": "tsc && node tools/fix-declarations.mjs",
+    "build:bundle": "rspack build --config rspack.config.mjs",
+    "build": "npm run clean && npm run build:types && npm run build:bundle",
     "test": "node --experimental-strip-types tools/run-tests.ts",
+    "test:types": "tsc --noEmit --strict --target ES2015 --module Node16 --moduleResolution Node16 --lib ES2015 --skipLibCheck false tools/types-smoke.ts",
+    "test:package": "node tools/package-smoke.mjs",
     "test:fuzz": "node --experimental-strip-types tools/fuzz-smoke.ts",
     "bench": "node --experimental-strip-types tools/benchmark.ts",
-    "bench:entries": "npm run build && node --experimental-strip-types tools/entry-benchmark.ts --dist"
+    "bench:entries": "npm run build && node --experimental-strip-types tools/entry-benchmark.ts --dist",
+    "prepublishOnly": "npm run build && npm run test:types && npm test && npm run test:package"
   },
   "devDependencies": {
+    "@rspack/cli": "^2.1.10",
+    "@rspack/core": "^2.1.10",
     "typescript": "^5.9.3"
   }
 }

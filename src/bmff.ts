@@ -137,6 +137,52 @@ function typeStr(b: Uint8Array, off: number) {
   return String.fromCharCode(b[off]!, b[off + 1]!, b[off + 2]!, b[off + 3]!);
 }
 
+function decodeUtf8(bytes: Uint8Array): string {
+  const output: string[] = [];
+  let index = 0;
+  while (index < bytes.length) {
+    const first = bytes[index++]!;
+    if (first < 0x80) {
+      output.push(String.fromCharCode(first));
+      continue;
+    }
+
+    let codePoint: number, minimum: number, continuations: number;
+    if (first >= 0xc2 && first <= 0xdf) {
+      codePoint = first & 0x1f; minimum = 0x80; continuations = 1;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      codePoint = first & 0x0f; minimum = 0x800; continuations = 2;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      codePoint = first & 0x07; minimum = 0x10000; continuations = 3;
+    } else {
+      output.push('\ufffd');
+      continue;
+    }
+
+    let complete = true;
+    for (let count = 0; count < continuations; count++) {
+      const next = bytes[index];
+      if (next === undefined || (next & 0xc0) !== 0x80) {
+        complete = false;
+        break;
+      }
+      codePoint = (codePoint << 6) | (next & 0x3f);
+      index++;
+    }
+    if (!complete || codePoint < minimum || codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff)) {
+      output.push('\ufffd');
+      continue;
+    }
+    if (codePoint <= 0xffff) output.push(String.fromCharCode(codePoint));
+    else {
+      codePoint -= 0x10000;
+      output.push(String.fromCharCode(0xd800 + (codePoint >> 10), 0xdc00 + (codePoint & 0x3ff)));
+    }
+  }
+  return output.join('');
+}
+
 interface Infe { itemId: number; itemType: string; }
 interface LocEntry {
   itemId: number;
@@ -361,7 +407,7 @@ export class HeifFile {
             // auxC is a FullBox followed by a NUL-terminated UTF-8 type string.
             const bytes = p.payload.subarray(4);
             const end = bytes.indexOf(0);
-            item.auxType = new TextDecoder().decode(end < 0 ? bytes : bytes.subarray(0, end));
+            item.auxType = decodeUtf8(end < 0 ? bytes : bytes.subarray(0, end));
             break;
           }
           case 'colr': {
