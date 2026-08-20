@@ -1,37 +1,16 @@
 import { detectFormat, HeifFile } from './bmff.ts';
 import type { BinaryInput, DecodeOptions, DecodedImage } from './decode-core.ts';
 
-export { DecodeError } from './decode-core.ts';
-export { detectFormat, HeifFile } from './bmff.ts';
-export { DEFAULT_DECODE_LIMITS } from './limits.ts';
 export type {
-  BinaryInput, Clap, DecodeErrorCode, DecodeOptions, DecodedImage, ImageItem, NclxColor,
+  BinaryInput, DecodeOptions, DecodedImage,
 } from './decode-core.ts';
 
-type DecoderModule = Pick<typeof import('./index.ts'), 'decodeToRgba' | 'decodeToImageData' | 'decode'>;
+type DecoderModule = Pick<typeof import('./index.ts'), 'decode'>;
 
 /** Decode after dynamically loading only the codec graph required by the input. */
-export async function decodeToRgbaAsync(
-  input: BinaryInput, options: DecodeOptions = {},
-): Promise<DecodedImage> {
-  const bytes = snapshotInput(input);
-  const decoder = await loadDecoder(bytes, options);
-  return decoder.decodeToRgba(bytes, options);
-}
-
-/** Dynamically load the required codec and return browser ImageData. */
-export async function decodeToImageDataAsync(
-  input: BinaryInput, options: DecodeOptions = {},
-): Promise<ImageData> {
-  const bytes = snapshotInput(input);
-  const decoder = await loadDecoder(bytes, options);
-  return decoder.decodeToImageData(bytes, options);
-}
-
-/** Dynamically load the required codec and return browser ImageBitmap. */
 export async function decode(
   input: BinaryInput, options: DecodeOptions = {},
-): Promise<ImageBitmap> {
+): Promise<DecodedImage> {
   const bytes = snapshotInput(input);
   const decoder = await loadDecoder(bytes, options);
   return decoder.decode(bytes, options);

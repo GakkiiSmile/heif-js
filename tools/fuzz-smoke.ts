@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { isMainThread, parentPort, Worker } from 'node:worker_threads';
-import { decodeToRgba } from '../src/index.ts';
+import { decode } from '../src/index.ts';
 
 const ITERATIONS = 300;
 
@@ -59,7 +59,7 @@ if (isMainThread) {
         }
       }
       try {
-        const image = decodeToRgba(bytes, {
+        const image = decode(bytes, {
           maxDimension: 4096,
           maxPixels: 16 * 1024 * 1024,
           maxTotalPixels: 32 * 1024 * 1024,

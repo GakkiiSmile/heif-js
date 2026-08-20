@@ -30,12 +30,14 @@
         const decoded = atob(encoded);
         binary = Uint8Array.from(decoded, character => character.charCodeAt(0));
       } else binary = await response.arrayBuffer();
-      const bitmap = await decode(binary);
+      const image = decode(binary);
       const canvas = document.createElement('canvas');
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
+      canvas.width = image.width;
+      canvas.height = image.height;
       const context = canvas.getContext('2d');
-      context.drawImage(bitmap, 0, 0);
+      const canvasImage = context.createImageData(image.width, image.height);
+      canvasImage.data.set(image.data);
+      context.putImageData(canvasImage, 0, 0);
       const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
       let nonTransparent = 0, checksum = 2166136261;
       for (let offset = 0; offset < pixels.length; offset += 4) {
@@ -45,9 +47,9 @@
         }
       }
       document.querySelector('#outputs').append(canvas);
-      const pixelsOk = nonTransparent > 0 && (!fixture.opaque || nonTransparent === bitmap.width * bitmap.height);
-      cases.push({ file: fixture.file, ok: bitmap instanceof ImageBitmap && pixelsOk,
-        type: bitmap.constructor.name, width: bitmap.width, height: bitmap.height,
+      const pixelsOk = nonTransparent > 0 && (!fixture.opaque || nonTransparent === image.width * image.height);
+      cases.push({ file: fixture.file, ok: image.data instanceof Uint8ClampedArray && pixelsOk,
+        type: 'DecodedImage', width: image.width, height: image.height,
         nonTransparent, checksum });
     }
     window.smokeResult = {

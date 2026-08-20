@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { decodeToImageData, decodeToRgba, DecodeError, detectFormat } from '../src/index.ts';
-import { decodeToRgba as decodeHeicToRgba } from '../src/heic.ts';
-import { decodeToRgba as decodeAvifToRgba } from '../src/avif.ts';
-import { decodeToRgbaAsync } from '../src/async.ts';
-import { HeifFile } from '../src/bmff.ts';
+import decodeDefault, { decode } from '../src/index.ts';
+import { decode as decodeHeic } from '../src/heic.ts';
+import { decode as decodeAvif } from '../src/avif.ts';
+import { decode as decodeAsync } from '../src/async.ts';
+import { detectFormat, HeifFile } from '../src/bmff.ts';
+import { DecodeError } from '../src/decode-core.ts';
 import { Av1Decoder } from '../src/av1/decode.ts';
 import { decodePng } from './png.ts';
 import { DecodedFrame, CHROMA_420, CHROMA_444 } from '../src/frame.ts';
@@ -20,6 +21,13 @@ const heicCases = [
   ['c', 256, 256],
 ] as const;
 
+assert.equal(decodeDefault, decode);
+assert.deepEqual(Object.keys(await import('../src/index.ts')).sort(), ['decode', 'default']);
+assert.deepEqual(Object.keys(await import('../src/heic.ts')).sort(), ['decode', 'default']);
+assert.deepEqual(Object.keys(await import('../src/avif.ts')).sort(), ['decode', 'default']);
+assert.deepEqual(Object.keys(await import('../src/async.ts')).sort(), ['decode', 'default']);
+console.log('ok public decoder entries only export decode');
+
 for (const [name, width, height] of heicCases) {
   const encoded = new Uint8Array(readFileSync(`testimages/heic_${name}.heic`));
   assert.equal(detectFormat(encoded), 'heic');
@@ -27,7 +35,7 @@ for (const [name, width, height] of heicCases) {
   // Exercise a non-zero byteOffset view as well as a plain Uint8Array.
   const padded = new Uint8Array(encoded.length + 7);
   padded.set(encoded, 3);
-  const decoded = decodeToRgba(padded.subarray(3, 3 + encoded.length));
+  const decoded = decode(padded.subarray(3, 3 + encoded.length));
   assert.deepEqual(Object.keys(decoded), ['width', 'height', 'data']);
   assert.equal(decoded.width, width);
   assert.equal(decoded.height, height);
@@ -41,24 +49,24 @@ for (const [name, width, height] of heicCases) {
 }
 
 const outputReuseEncoded = new Uint8Array(readFileSync('testimages/heic_a.heic'));
-const outputReuseExpected = decodeToRgba(outputReuseEncoded);
+const outputReuseExpected = decode(outputReuseEncoded);
 const reusableOutput = new Uint8ClampedArray(outputReuseExpected.data.length);
-const outputReuseDecoded = decodeToRgba(outputReuseEncoded, { output: reusableOutput });
+const outputReuseDecoded = decode(outputReuseEncoded, { output: reusableOutput });
 assert.equal(outputReuseDecoded.data, reusableOutput);
 assert.deepEqual(outputReuseDecoded.data, outputReuseExpected.data);
 assert.throws(
-  () => decodeToRgba(outputReuseEncoded, { output: new Uint8ClampedArray(reusableOutput.length - 1) }),
+  () => decode(outputReuseEncoded, { output: new Uint8ClampedArray(reusableOutput.length - 1) }),
   (error: unknown) => error instanceof DecodeError && error.code === 'INVALID_INPUT',
 );
 const overlappingStorage = new ArrayBuffer(reusableOutput.length);
 const overlappingInput = new Uint8Array(overlappingStorage, 0, outputReuseEncoded.length);
 overlappingInput.set(outputReuseEncoded);
 assert.throws(
-  () => decodeToRgba(overlappingInput, { output: new Uint8ClampedArray(overlappingStorage) }),
+  () => decode(overlappingInput, { output: new Uint8ClampedArray(overlappingStorage) }),
   (error: unknown) => error instanceof DecodeError && error.code === 'INVALID_INPUT',
 );
 const asyncReusableOutput = new Uint8ClampedArray(reusableOutput.length);
-const asyncOutputReuseDecoded = await decodeToRgbaAsync(outputReuseEncoded, { output: asyncReusableOutput });
+const asyncOutputReuseDecoded = await decodeAsync(outputReuseEncoded, { output: asyncReusableOutput });
 assert.equal(asyncOutputReuseDecoded.data, asyncReusableOutput);
 assert.deepEqual(asyncOutputReuseDecoded.data, outputReuseExpected.data);
 console.log('ok caller-provided RGBA output buffer reuse + overlap/size validation');
@@ -102,38 +110,9 @@ if (typeof SharedArrayBuffer !== 'undefined') {
   const decodeShared = new SharedArrayBuffer(source.length + 7);
   const decodeSharedView = new Uint8Array(decodeShared, 3, source.length);
   decodeSharedView.set(source);
-  assert.deepEqual(decodeToRgba(decodeSharedView), decodeToRgba(source));
+  assert.deepEqual(decode(decodeSharedView), decode(source));
   console.log('ok SharedArrayBuffer input is snapshotted for parsing, lazy data, and decode');
 }
-
-const originalImageData = globalThis.ImageData;
-let capturedImageDataPixels: Uint8ClampedArray<ArrayBuffer> | undefined;
-class FakeImageData {
-  readonly data: Uint8ClampedArray<ArrayBuffer>;
-  readonly width: number;
-  readonly height: number;
-  constructor(
-    data: Uint8ClampedArray<ArrayBuffer>,
-    width: number,
-    height: number,
-  ) {
-    this.data = data;
-    this.width = width;
-    this.height = height;
-    capturedImageDataPixels = data;
-  }
-}
-Object.defineProperty(globalThis, 'ImageData', { configurable: true, value: FakeImageData });
-try {
-  const imageData = decodeToImageData(new Uint8Array(readFileSync('testimages/heic_b.heic')));
-  assert.equal(imageData.data, capturedImageDataPixels);
-  assert.ok(capturedImageDataPixels!.buffer instanceof ArrayBuffer);
-  assert.deepEqual([imageData.width, imageData.height], [320, 240]);
-} finally {
-  if (originalImageData === undefined) delete (globalThis as { ImageData?: unknown }).ImageData;
-  else Object.defineProperty(globalThis, 'ImageData', { configurable: true, value: originalImageData });
-}
-console.log('ok ImageData receives the decoder\'s ArrayBuffer-backed pixel view');
 
 // Sparse RBSP escape tracking must retain exact EBSP offsets without the old
 // full-size Uint32Array map, and escape-free NAL units should remain zero-copy.
@@ -181,7 +160,7 @@ if (typeof SharedArrayBuffer !== 'undefined') {
   console.log('ok HEVC direct NAL APIs snapshot SharedArrayBuffer input');
 }
 
-const oddHeic = decodeToRgba(readBase64Fixture('testimages/heic_odd_conformance.heic.b64'));
+const oddHeic = decode(readBase64Fixture('testimages/heic_odd_conformance.heic.b64'));
 assert.deepEqual([oddHeic.width, oddHeic.height], [321, 239]);
 assert.equal(fnv1a(oddHeic.data), 3265260004);
 console.log('ok HEIC SPS conformance window + clap: 321x239');
@@ -207,11 +186,11 @@ for (const [name, type, width, height, checksum] of [
   const encoded = readBase64Fixture(`testimages/heif_${name}.heic.b64`);
   const file = new HeifFile().parse(encoded);
   assert.equal(file.primary.type, type);
-  const decoded = decodeToRgba(encoded);
+  const decoded = decode(encoded);
   assert.deepEqual([decoded.width, decoded.height], [width, height]);
   assert.equal(fnv1a(decoded.data), checksum);
   const reused = new Uint8ClampedArray(decoded.data.length);
-  const decodedInto = decodeToRgba(encoded, { output: reused });
+  const decodedInto = decode(encoded, { output: reused });
   assert.equal(decodedInto.data, reused);
   assert.deepEqual(decodedInto.data, decoded.data);
   if (name === 'grid') assert.equal(file.primary.references.dimg?.length, 6);
@@ -235,14 +214,14 @@ const firstTileId = repeatedGridView.getUint16(dimgOffset + 8);
 for (let index = 1; index < referenceCount; index++) {
   repeatedGridView.setUint16(dimgOffset + 8 + index * 2, firstTileId);
 }
-const repeatedGridExpected = decodeToRgba(repeatedGrid);
-const repeatedGridLimited = decodeToRgba(repeatedGrid, { maxTotalPixels: 100_000 });
+const repeatedGridExpected = decode(repeatedGrid);
+const repeatedGridLimited = decode(repeatedGrid, { maxTotalPixels: 100_000 });
 assert.deepEqual(repeatedGridLimited, repeatedGridExpected);
 console.log('ok HEIF repeated item references: immutable decode cache + cumulative pixel budget');
 
 const cumulativeItemBytes = readBase64Fixture('testimages/heif_grid.heic.b64');
 assert.throws(
-  () => decodeToRgba(cumulativeItemBytes, { maxItemBytes: 7_000, maxTotalItemBytes: 6_000 }),
+  () => decode(cumulativeItemBytes, { maxItemBytes: 7_000, maxTotalItemBytes: 6_000 }),
   (error: unknown) => error instanceof DecodeError && error.code === 'RESOURCE_LIMIT' && /cumulative/.test(error.message),
 );
 console.log('ok HEIF cumulative assembled-item byte limit');
@@ -255,7 +234,7 @@ for (const path of [
   'testimages/heif_prem.heic.b64',
 ]) {
   const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
-  assert.deepEqual(decodeHeicToRgba(encoded), decodeToRgba(encoded));
+  assert.deepEqual(decodeHeic(encoded), decode(encoded));
 }
 for (const path of [
   'testimages/avif_a_8.avif',
@@ -264,14 +243,14 @@ for (const path of [
   'testimages/avif_restoration.avif.b64',
 ]) {
   const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
-  assert.deepEqual(decodeAvifToRgba(encoded), decodeToRgba(encoded));
+  assert.deepEqual(decodeAvif(encoded), decode(encoded));
 }
 assert.throws(
-  () => decodeHeicToRgba(new Uint8Array(readFileSync('testimages/avif_a_8.avif'))),
+  () => decodeHeic(new Uint8Array(readFileSync('testimages/avif_a_8.avif'))),
   (error: unknown) => error instanceof DecodeError && error.code === 'UNSUPPORTED_CODEC' && /AV1/.test(error.message),
 );
 assert.throws(
-  () => decodeAvifToRgba(new Uint8Array(readFileSync('testimages/heic_a.heic'))),
+  () => decodeAvif(new Uint8Array(readFileSync('testimages/heic_a.heic'))),
   (error: unknown) => error instanceof DecodeError && error.code === 'UNSUPPORTED_CODEC' && /HEVC/.test(error.message),
 );
 console.log('ok codec-specific entries: exact derived images + explicit cross-codec errors');
@@ -282,7 +261,7 @@ for (const path of [
   'testimages/heif_grid.heic.b64',
 ]) {
   const encoded = path.endsWith('.b64') ? readBase64Fixture(path) : new Uint8Array(readFileSync(path));
-  assert.deepEqual(await decodeToRgbaAsync(encoded), decodeToRgba(encoded));
+  assert.deepEqual(await decodeAsync(encoded), decode(encoded));
 }
 console.log('ok async entry dynamically selects HEVC, AV1, and generic HEIF inputs');
 
@@ -355,7 +334,7 @@ const avifCases = [
 for (const [name, width, height, minimumPsnr] of avifCases) {
   const encoded = new Uint8Array(readFileSync(`testimages/${name}.avif`));
   assert.equal(detectFormat(encoded), 'avif');
-  const decoded = decodeToRgba(encoded);
+  const decoded = decode(encoded);
   assert.equal(decoded.width, width);
   assert.equal(decoded.height, height);
   assert.equal(decoded.data.length, width * height * 4);
@@ -404,11 +383,11 @@ console.log('ok AVIF quantization matrices: raw planes exact');
 const intrabcEncoded = new Uint8Array(Buffer.from(
   readFileSync('testimages/avif_intrabc.avif.b64', 'utf8').replace(/\s/g, ''), 'base64',
 ));
-const intrabcDecoded = decodeToRgba(intrabcEncoded);
+const intrabcDecoded = decode(intrabcEncoded);
 assert.equal(intrabcDecoded.width, 240);
 assert.equal(intrabcDecoded.height, 320);
 const intrabcOutput = new Uint8ClampedArray(intrabcDecoded.data.length);
-const intrabcDecodedInto = decodeToRgba(intrabcEncoded, { output: intrabcOutput });
+const intrabcDecodedInto = decode(intrabcEncoded, { output: intrabcOutput });
 assert.equal(intrabcDecodedInto.data, intrabcOutput);
 assert.deepEqual(intrabcDecodedInto.data, intrabcDecoded.data);
 const intrabcReference = await decodePng(Buffer.from(
@@ -421,7 +400,7 @@ console.log(`ok AVIF IntraBC: 240x320, RGB PSNR ${intrabcPsnr.toFixed(2)} dB`);
 const multiTileEncoded = new Uint8Array(Buffer.from(
   readFileSync('testimages/avif_multitile_multigroup.avif.b64', 'utf8').replace(/\s/g, ''), 'base64',
 ));
-const multiTileDecoded = decodeToRgba(multiTileEncoded);
+const multiTileDecoded = decode(multiTileEncoded);
 assert.equal(multiTileDecoded.width, 512);
 assert.equal(multiTileDecoded.height, 384);
 const multiTileReference = Buffer.from(
@@ -447,7 +426,7 @@ const superResEncoded = new Uint8Array(Buffer.from(
 ));
 const superResFile = new HeifFile().parse(superResEncoded);
 assert.equal(fnv1aPlanes8(new Av1Decoder().decode(superResFile.primary.data).frame.planes), 95560061);
-const superResDecoded = decodeToRgba(superResEncoded);
+const superResDecoded = decode(superResEncoded);
 assert.equal(superResDecoded.width, 512);
 assert.equal(superResDecoded.height, 384);
 const superResReference = Buffer.from(
@@ -459,7 +438,7 @@ console.log(`ok AVIF super-res 341->512: 512x384, sampled RGB PSNR ${superResPsn
 
 for (const [layout, minimumPsnr] of [['422', 44], ['444', 46]] as const) {
   const encoded = readBase64Fixture(`testimages/avif_${layout}.avif.b64`);
-  const decoded = decodeToRgba(encoded);
+  const decoded = decode(encoded);
   assert.equal(decoded.width, 320);
   assert.equal(decoded.height, 240);
   const reference = readBase64Fixture(`testimages/gt_avif_${layout}.rgb.b64`);
@@ -471,7 +450,7 @@ for (const [layout, minimumPsnr] of [['422', 44], ['444', 46]] as const) {
 const filmGrainEncoded = readBase64Fixture('testimages/avif_filmgrain.avif.b64');
 const filmGrainFile = new HeifFile().parse(filmGrainEncoded);
 assert.equal(fnv1aPlanes8(new Av1Decoder().decode(filmGrainFile.primary.data).frame.planes), 2940198444);
-const filmGrainDecoded = decodeToRgba(filmGrainEncoded);
+const filmGrainDecoded = decode(filmGrainEncoded);
 const filmGrainReference = readBase64Fixture('testimages/gt_avif_filmgrain.rgb.b64');
 const filmGrainPsnr = sampledRgbPsnr(filmGrainDecoded.data, 512, filmGrainReference, 32, 24, 16);
 assert.ok(filmGrainPsnr > 40, `AVIF film-grain RGB PSNR is too low: ${filmGrainPsnr.toFixed(2)} dB`);
@@ -487,26 +466,26 @@ assert.deepEqual(
   [0, 2, 3].map(type => restorationSyntax.restorationUnits.filter(unit => unit.type === type).length),
   [37, 31, 4],
 );
-const restorationDecoded = decodeToRgba(restorationEncoded);
+const restorationDecoded = decode(restorationEncoded);
 const restorationReference = readBase64Fixture('testimages/gt_avif_restoration.rgb.b64');
 const restorationPsnr = sampledRgbPsnr(restorationDecoded.data, 2048, restorationReference, 32, 24, 64);
 assert.ok(restorationPsnr > 15, `AVIF restoration RGB PSNR is too low: ${restorationPsnr.toFixed(2)} dB`);
 console.log(`ok AVIF restoration syntax/range: 2048x1536, sampled RGB PSNR ${restorationPsnr.toFixed(2)} dB`);
 
 assert.throws(
-  () => decodeToRgba(new Uint8Array(32)),
+  () => decode(new Uint8Array(32)),
   (error: unknown) => error instanceof DecodeError && error.code === 'UNSUPPORTED_FORMAT',
 );
 console.log('ok invalid input error');
 
 assert.throws(
-  () => decodeToRgba(new Uint8Array(readFileSync('testimages/avif_a_8.avif')), { maxPixels: 100 }),
+  () => decode(new Uint8Array(readFileSync('testimages/avif_a_8.avif')), { maxPixels: 100 }),
   (error: unknown) => error instanceof DecodeError && error.code === 'RESOURCE_LIMIT',
 );
 console.log('ok resource limit error');
 
 assert.throws(
-  () => decodeToRgba(new Uint8Array(readFileSync('testimages/avif_a_8.avif')), { maxPixels: 0 }),
+  () => decode(new Uint8Array(readFileSync('testimages/avif_a_8.avif')), { maxPixels: 0 }),
   (error: unknown) => error instanceof DecodeError && error.code === 'INVALID_INPUT',
 );
 console.log('ok invalid decode options error');
@@ -516,7 +495,7 @@ const invalidAv1CFile = new HeifFile().parse(invalidAv1C);
 const invalidAv1COffset = invalidAv1CFile.primary.config!.byteOffset - invalidAv1C.byteOffset;
 invalidAv1C[invalidAv1COffset + 3] |= 0x80;
 assert.throws(
-  () => decodeToRgba(invalidAv1C),
+  () => decode(invalidAv1C),
   (error: unknown) => error instanceof DecodeError && error.code === 'DECODE_FAILED' && /av1C/.test(error.message),
 );
 console.log('ok invalid av1C error');

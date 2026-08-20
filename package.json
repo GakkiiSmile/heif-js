@@ -1,7 +1,7 @@
 {
   "name": "heif-js",
   "version": "0.1.0",
-  "description": "Pure TypeScript HEIC/HEIF/AVIF decoder (input: binary, output: ImageBitmap/ImageData)",
+  "description": "Pure TypeScript HEIC/HEIF/AVIF decoder (input: binary, output: RGBA8 pixels)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

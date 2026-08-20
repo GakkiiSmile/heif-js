@@ -1,22 +1,17 @@
 # heif-js
 
 纯 TypeScript 的静态 HEIC、HEIF 与 AVIF 解码器。输入 `ArrayBuffer` 或任意
-TypedArray/DataView，浏览器中直接得到 `ImageBitmap`。不依赖 WASM、原生模块、
-WebCodecs，也不借用浏览器内置的 HEIF/AVIF 解码能力。
+TypedArray/DataView，直接得到包含 RGBA8 像素的 `DecodedImage`。不依赖 WASM、
+原生模块、WebCodecs，也不借用浏览器内置的 HEIF/AVIF 解码能力。
 
 ## 使用
 
 ```ts
-import decode, { decodeToRgba } from 'heif-js';
+import { decode } from 'heif-js';
 
 const response = await fetch('/photo.avif');
 const binary = await response.arrayBuffer();
-
-const bitmap = await decode(binary);
-canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
-
-// 非 DOM 环境或需要直接访问像素时：
-const { width, height, data } = decodeToRgba(binary);
+const { width, height, data } = decode(binary);
 // data 是 width × height × 4 的 Uint8ClampedArray（straight-alpha sRGB RGBA8）。
 ```
 
@@ -25,12 +20,12 @@ const { width, height, data } = decodeToRgba(binary);
 
 ```ts
 const output = new Uint8ClampedArray(width * height * 4);
-const image = decodeToRgba(binary, { output });
+const image = decode(binary, { output });
 // image.data === output
 ```
 
-也可以使用 `decodeToImageData(binary)`。`decodeToRgba` 是同步函数；默认导出的
-`decode` 调用浏览器 `createImageBitmap()`，因此返回 `Promise<ImageBitmap>`。
+`decode` 是同步函数，返回 `{ width, height, data }`。解码入口不创建或返回任何
+浏览器专用图像对象；默认导出与具名导出指向同一个 `decode` 函数。
 
 只需要识别格式或读取 HEIF 元数据时，可使用轻量入口，避免加载 AV1/HEVC
 解码表：
@@ -45,21 +40,20 @@ import { detectFormat, HeifFile } from 'heif-js/detect';
 `SharedArrayBuffer` 输入会先建立稳定快照。
 
 已知输入只使用一种编码时，可通过 `heif-js/heic` 或
-`heif-js/avif` 使用同一套同步 API，只加载对应 codec。希望自动按格式
-拆包且可以接受异步 RGBA 时，可使用：
+`heif-js/avif` 使用同一套同步 `decode` API，只加载对应 codec。希望自动按格式
+拆包且可以接受异步返回值时，可使用：
 
 ```ts
-import { decodeToRgbaAsync } from 'heif-js/async';
+import { decode } from 'heif-js/async';
 
-const image = await decodeToRgbaAsync(binary);
+const image = await decode(binary);
 ```
 
 同步 codec 专用入口仍完整支持 grid、identity、overlay、辅助 alpha、变换和资源限制；
 若交给了另一种 codec，会抛出 `DecodeError`，其 `code` 为 `UNSUPPORTED_CODEC`。
-`async` 入口还导出异步的 `decodeToImageDataAsync()`，默认导出 `decode()` 则返回
-`Promise<ImageBitmap>`。为了在动态 `import()` 期间隔离调用方修改，异步入口会在首次
-`await` 前复制一份编码输入；同步入口不会额外复制普通 `ArrayBuffer` backing，
-但会为 `SharedArrayBuffer` 建立快照。
+`async` 入口返回 `Promise<DecodedImage>`。为了在动态 `import()` 期间隔离调用方修改，
+它会在首次 `await` 前复制一份编码输入；同步入口不会额外复制普通 `ArrayBuffer`
+backing，但会为 `SharedArrayBuffer` 建立快照。
 
 ## 解码能力
 
@@ -85,7 +79,7 @@ const image = await decodeToRgbaAsync(binary);
   - BT.709、Display-P3、BT.2020 等原色到 sRGB 的线性光转换
   - PQ/HLG 到 RGBA8 的 SDR 映射
   - 常见 matrix/TRC 型 `rICC` / `prof` ICC 配置
-- 结构化 `DecodeError`，包含格式、配置、解码、运行环境和资源限制错误码
+- 结构化 `DecodeError`，包含格式、配置、解码和资源限制错误码
 
 ## 资源限制
 
@@ -93,7 +87,7 @@ const image = await decodeToRgbaAsync(binary);
 处理超大图片时可以按需放宽：
 
 ```ts
-const bitmap = await decode(binary, {
+const image = decode(binary, {
   maxDimension: 100_000,
   maxPixels: 120_000_000,
   maxTotalPixels: 240_000_000,
@@ -101,7 +95,8 @@ const bitmap = await decode(binary, {
 });
 ```
 
-所有选项及默认值由 `DecodeOptions` 和 `DEFAULT_DECODE_LIMITS` 导出。
+解码入口导出 `DecodeOptions` 类型；默认限制 `DEFAULT_DECODE_LIMITS` 可从
+`heif-js/detect` 导入。
 
 ## 范围
 
@@ -129,4 +124,4 @@ npm run bench:entries
 回归语料包含 HEIC/AVIF 的多位深和色度格式、IntraBC、多 tile/group、super-res、
 film grain、loop restoration、量化矩阵、full header、grid、overlay、alpha、奇数尺寸
 裁剪与颜色配置。关键 AV1/HEVC 样本会与 dav1d/FFmpeg/libheif 参考输出进行原始平面
-或像素质量校验；浏览器冒烟页还会验证结果确实是可绘制的 `ImageBitmap`。
+或像素质量校验；浏览器冒烟页还会验证返回的 RGBA8 像素可以正确绘制到画布。

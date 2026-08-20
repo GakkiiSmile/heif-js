@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { decodeToRgba } from '../src/index.ts';
+import { decode } from '../src/index.ts';
 import { HeifFile } from '../src/bmff.ts';
 import { Av1Decoder } from '../src/av1/decode.ts';
 import { frameToRgba } from '../src/color.ts';
@@ -36,7 +36,7 @@ const fixtures = [
 const results: Result[] = [];
 for (const [name, path, width, height] of fixtures) {
   const encoded = readFixture(path);
-  results.push(benchmark(name, width, height, () => decodeToRgba(encoded).data));
+  results.push(benchmark(name, width, height, () => decode(encoded).data));
 }
 
 // Isolate the hot YUV-to-RGBA stage from entropy decoding and loop filters.
@@ -103,7 +103,7 @@ function benchmark(
 function measureDecodeMemory(path: string): Pick<Result, 'outputMiB' | 'rssMiB'> {
   const script = `
     import { readFileSync } from 'node:fs';
-    import { decodeToRgba } from './src/index.ts';
+    import { decode } from './src/index.ts';
     const path = ${JSON.stringify(path)};
     const raw = readFileSync(path);
     const bytes = path.endsWith('.b64')
@@ -112,7 +112,7 @@ function measureDecodeMemory(path: string): Pick<Result, 'outputMiB' | 'rssMiB'>
     globalThis.__benchmarkRetained = { raw, bytes };
     globalThis.gc();
     const before = process.memoryUsage();
-    const image = decodeToRgba(bytes);
+    const image = decode(bytes);
     globalThis.__benchmarkRetained = { raw, bytes, image };
     globalThis.gc();
     const after = process.memoryUsage();

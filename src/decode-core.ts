@@ -27,8 +27,7 @@ export type DecodeErrorCode =
   | 'UNSUPPORTED_CODEC'
   | 'MISSING_CONFIG'
   | 'RESOURCE_LIMIT'
-  | 'DECODE_FAILED'
-  | 'IMAGE_BITMAP_UNAVAILABLE';
+  | 'DECODE_FAILED';
 
 export class DecodeError extends Error {
   readonly code: DecodeErrorCode;
@@ -52,38 +51,15 @@ export interface CodecDecoders {
   av1?: ItemCodecDecoder;
 }
 
-export interface DecoderApi {
-  decodeToRgba(input: BinaryInput, options?: DecodeOptions): DecodedImage;
-  decodeToImageData(input: BinaryInput, options?: DecodeOptions): ImageData;
-  decode(input: BinaryInput, options?: DecodeOptions): Promise<ImageBitmap>;
-}
+export type Decoder = (input: BinaryInput, options?: DecodeOptions) => DecodedImage;
 
 /** Bind the shared HEIF container/derived-image pipeline to one or more codecs. */
-export function createDecoder(codecs: Readonly<CodecDecoders>): DecoderApi {
-  const decodeToRgba = (input: BinaryInput, options: DecodeOptions = {}): DecodedImage =>
-    decodeToRgbaWithCodecs(input, options, codecs);
-  const decodeToImageData = (input: BinaryInput, options: DecodeOptions = {}): ImageData => {
-    if (typeof ImageData === 'undefined') {
-      throw new DecodeError('IMAGE_BITMAP_UNAVAILABLE', 'ImageData is not available in this runtime');
-    }
-    const image = decodeToRgba(input, options);
-    // Internal decode buffers are ArrayBuffer-backed. Keep the fallback for a
-    // future alternate decoder returning a SharedArrayBuffer view.
-    const pixels = image.data.buffer instanceof ArrayBuffer
-      ? image.data as Uint8ClampedArray<ArrayBuffer>
-      : new Uint8ClampedArray(image.data);
-    return new ImageData(pixels, image.width, image.height);
-  };
-  const decode = async (input: BinaryInput, options: DecodeOptions = {}): Promise<ImageBitmap> => {
-    if (typeof createImageBitmap !== 'function') {
-      throw new DecodeError('IMAGE_BITMAP_UNAVAILABLE', 'createImageBitmap is not available in this runtime');
-    }
-    return createImageBitmap(decodeToImageData(input, options));
-  };
-  return { decodeToRgba, decodeToImageData, decode };
+export function createDecoder(codecs: Readonly<CodecDecoders>): Decoder {
+  return (input: BinaryInput, options: DecodeOptions = {}): DecodedImage =>
+    decodeWithCodecs(input, options, codecs);
 }
 
-function decodeToRgbaWithCodecs(
+function decodeWithCodecs(
   input: BinaryInput, options: DecodeOptions, codecs: Readonly<CodecDecoders>,
 ): DecodedImage {
   const bytes = asUint8Array(input);

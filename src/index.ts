@@ -2,16 +2,10 @@ import { createDecoder } from './decode-core.ts';
 import { decodeAv1Item } from './avif-codec.ts';
 import { decodeHevcItem } from './heic-codec.ts';
 
-export { DecodeError, HeifFile, detectFormat } from './decode-core.ts';
-export { DEFAULT_DECODE_LIMITS } from './decode-core.ts';
 export type {
-  BinaryInput, Clap, DecodeErrorCode, DecodeOptions, DecodedImage, ImageItem, NclxColor,
+  BinaryInput, DecodeOptions, DecodedImage,
 } from './decode-core.ts';
 
-const decoder = createDecoder({ hevc: decodeHevcItem, av1: decodeAv1Item });
-
-export const decodeToRgba = decoder.decodeToRgba;
-export const decodeToImageData = decoder.decodeToImageData;
-export const decode = decoder.decode;
+export const decode = createDecoder({ hevc: decodeHevcItem, av1: decodeAv1Item });
 
 export default decode;

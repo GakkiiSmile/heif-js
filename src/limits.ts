@@ -1,7 +1,7 @@
 /** Resource limits applied while parsing and decoding untrusted image data. */
 export interface DecodeOptions {
   /**
-   * Optional exact-size RGBA8 destination reused by decodeToRgba. Its length
+   * Optional exact-size RGBA8 destination reused by decode. Its length
    * must equal decoded width * height * 4 and it must not overlap the input.
    */
   output?: Uint8ClampedArray;
