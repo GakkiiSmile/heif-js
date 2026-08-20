@@ -1,4 +1,4 @@
-# heic-decode-pure-js
+# heif-js
 
 纯 TypeScript 的静态 HEIC、HEIF 与 AVIF 解码器。输入 `ArrayBuffer` 或任意
 TypedArray/DataView，浏览器中直接得到 `ImageBitmap`。不依赖 WASM、原生模块、
@@ -7,7 +7,7 @@ WebCodecs，也不借用浏览器内置的 HEIF/AVIF 解码能力。
 ## 使用
 
 ```ts
-import decode, { decodeToRgba } from 'heic-decode-pure-js';
+import decode, { decodeToRgba } from 'heif-js';
 
 const response = await fetch('/photo.avif');
 const binary = await response.arrayBuffer();
@@ -36,7 +36,7 @@ const image = decodeToRgba(binary, { output });
 解码表：
 
 ```ts
-import { detectFormat, HeifFile } from 'heic-decode-pure-js/detect';
+import { detectFormat, HeifFile } from 'heif-js/detect';
 ```
 
 `HeifFile.parse()` 只解析容器元数据；未使用 item 的 extent 会在首次读取
@@ -44,12 +44,12 @@ import { detectFormat, HeifFile } from 'heic-decode-pure-js/detect';
 输入的单 extent 会保留为零复制 view，因此在读取 lazy `item.data` 前不要修改原输入；
 `SharedArrayBuffer` 输入会先建立稳定快照。
 
-已知输入只使用一种编码时，可通过 `heic-decode-pure-js/heic` 或
-`heic-decode-pure-js/avif` 使用同一套同步 API，只加载对应 codec。希望自动按格式
+已知输入只使用一种编码时，可通过 `heif-js/heic` 或
+`heif-js/avif` 使用同一套同步 API，只加载对应 codec。希望自动按格式
 拆包且可以接受异步 RGBA 时，可使用：
 
 ```ts
-import { decodeToRgbaAsync } from 'heic-decode-pure-js/async';
+import { decodeToRgbaAsync } from 'heif-js/async';
 
 const image = await decodeToRgbaAsync(binary);
 ```

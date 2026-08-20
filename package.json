@@ -1,5 +1,5 @@
 {
-  "name": "heic-decode-pure-js",
+  "name": "heif-js",
   "version": "0.1.0",
   "description": "Pure TypeScript HEIC/HEIF/AVIF decoder (input: binary, output: ImageBitmap/ImageData)",
   "type": "module",
