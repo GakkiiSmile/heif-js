@@ -356,8 +356,11 @@ export function parseScalingList(r: BitReader): ScalingLists {
         if (delta === 0) {
           list = (sizeId === 0 ? DEFAULT_SCALING_4 : matrixId < 3 ? DEFAULT_SCALING_8_INTRA : DEFAULT_SCALING_8_INTER).slice();
         } else {
-          list = lists[sizeId][refId].slice();
-          dc[sizeId][matrixId] = dc[sizeId][refId] || 16;
+          if (refId < 0 || !lists[sizeId][refId]) {
+            throw new Error('HEVC: scaling-list delta references an earlier matrix that does not exist');
+          }
+          list = lists[sizeId][refId]!.slice();
+          dc[sizeId][matrixId] = dc[sizeId]![refId]! || 16;
         }
       } else {
         let nextCoef = 8;

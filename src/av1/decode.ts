@@ -333,6 +333,13 @@ class TileDecoder {
     const haveHorizontal = this.bounds.endX > bx + halfSize4;
     const haveVertical = this.bounds.endY > by + halfSize4;
     if (!haveHorizontal && !haveVertical) {
+      // Level 4 (8x8 blocks) is the tree floor: the partition is inferred as
+      // SPLIT with a single 4x4 block, and no partition symbol is read.
+      if (level >= 4) {
+        this.decodeBlock(level, partitionBlockSizes[4]![PARTITION_SPLIT]![0]!, bx, by);
+        this.updatePartitionContext(level, PARTITION_SPLIT, bx, by, halfSize4);
+        return;
+      }
       this.decodePartition(level + 1, bx, by);
       return;
     }
@@ -349,8 +356,13 @@ class TileDecoder {
       const split = this.msac.bool(gatherTopPartitionProbability(partitionCdf, level));
       partition = split ? PARTITION_SPLIT : PARTITION_H;
       if (split) {
-        this.decodePartition(level + 1, bx, by);
-        this.decodePartition(level + 1, bx + halfSize4, by);
+        if (level >= 4) {
+          this.decodeBlock(level, partitionBlockSizes[4]![PARTITION_SPLIT]![0]!, bx, by);
+          this.decodeBlock(level, partitionBlockSizes[4]![PARTITION_SPLIT]![0]!, bx + halfSize4, by);
+        } else {
+          this.decodePartition(level + 1, bx, by);
+          this.decodePartition(level + 1, bx + halfSize4, by);
+        }
       } else {
         this.decodeBlock(level, partitionBlockSizes[level]![PARTITION_H]![0]!, bx, by);
       }
@@ -358,18 +370,28 @@ class TileDecoder {
       const split = this.msac.bool(gatherLeftPartitionProbability(partitionCdf, level));
       partition = split ? PARTITION_SPLIT : PARTITION_V;
       if (split) {
-        this.decodePartition(level + 1, bx, by);
-        this.decodePartition(level + 1, bx, by + halfSize4);
+        if (level >= 4) {
+          this.decodeBlock(level, partitionBlockSizes[4]![PARTITION_SPLIT]![0]!, bx, by);
+          this.decodeBlock(level, partitionBlockSizes[4]![PARTITION_SPLIT]![0]!, bx, by + halfSize4);
+        } else {
+          this.decodePartition(level + 1, bx, by);
+          this.decodePartition(level + 1, bx, by + halfSize4);
+        }
       } else {
         this.decodeBlock(level, partitionBlockSizes[level]![PARTITION_V]![0]!, bx, by);
       }
     }
 
     if (partition !== PARTITION_SPLIT || level === 4) {
-      const count = Math.min(halfSize4, this.abovePartition.length - bx8);
-      this.abovePartition.fill(al_part_ctx[0]![level]![partition]!, bx8, bx8 + count);
-      this.leftPartition.fill(al_part_ctx[1]![level]![partition]!, by8, Math.min(16, by8 + halfSize4));
+      this.updatePartitionContext(level, partition, bx, by, halfSize4);
     }
+  }
+
+  private updatePartitionContext(level: number, partition: number, bx: number, by: number, halfSize4: number): void {
+    const bx8 = bx >> 1, by8 = (by & 31) >> 1;
+    const count = Math.min(halfSize4, this.abovePartition.length - bx8);
+    this.abovePartition.fill(al_part_ctx[0]![level]![partition]!, bx8, bx8 + count);
+    this.leftPartition.fill(al_part_ctx[1]![level]![partition]!, by8, Math.min(16, by8 + halfSize4));
   }
 
   private decodePartitionChildren(level: number, partition: number, bx: number, by: number, half: number): void {
@@ -961,7 +983,9 @@ class TileDecoder {
       this.addMvCandidate(candidates, candidateX, y4, length * 2);
       x += length;
       if (x >= w4) return 1;
-      candidateX = x4 + x;
+      const next = nextMvScanPosition(x4, x, this.bounds.endX);
+      if (next === null) return 1;
+      candidateX = next;
       dimensions = block_dimensions[this.blockSizeMap[this.mapIndex(candidateX, y4)]!]!;
       candidateWidth = dimensions[0]!;
       length = Math.max(step, candidateWidth);
@@ -987,7 +1011,9 @@ class TileDecoder {
       this.addMvCandidate(candidates, x4, candidateY, length * 2);
       y += length;
       if (y >= h4) return 1;
-      candidateY = y4 + y;
+      const next = nextMvScanPosition(y4, y, this.bounds.endY);
+      if (next === null) return 1;
+      candidateY = next;
       dimensions = block_dimensions[this.blockSizeMap[this.mapIndex(x4, candidateY)]!]!;
       candidateHeight = dimensions[1]!;
       length = Math.max(step, candidateHeight);
@@ -1295,17 +1321,25 @@ class TileDecoder {
 }
 
 function gatherLeftPartitionProbability(cdf: number[], level: number): number {
+  // Level-4 CDFs stop after the implicitly-terminated SPLIT symbol; reading a
+  // missing entry as 0 restricts the probability sum to symbols that exist.
   let probability = cdf[PARTITION_H - 1]! - cdf[PARTITION_H]!;
-  probability += cdf[PARTITION_SPLIT - 1]! - cdf[PARTITION_T_LEFT]!;
-  if (level !== 0) probability += cdf[PARTITION_H4 - 1]! - cdf[PARTITION_H4]!;
+  probability += cdf[PARTITION_SPLIT - 1]! - (cdf[PARTITION_T_LEFT] ?? 0);
+  if (level !== 0) probability += (cdf[PARTITION_H4 - 1] ?? 0) - (cdf[PARTITION_H4] ?? 0);
   return probability;
 }
 
 function gatherTopPartitionProbability(cdf: number[], level: number): number {
-  let probability = cdf[PARTITION_V - 1]! - cdf[PARTITION_T_TOP]!;
-  probability += cdf[PARTITION_T_LEFT - 1]!;
-  if (level !== 0) probability += cdf[PARTITION_V4 - 1]! - cdf[PARTITION_T_RIGHT]!;
+  let probability = cdf[PARTITION_V - 1]! - (cdf[PARTITION_T_TOP] ?? 0);
+  probability += cdf[PARTITION_T_LEFT - 1] ?? 0;
+  if (level !== 0) probability += (cdf[PARTITION_V4 - 1] ?? 0) - (cdf[PARTITION_T_RIGHT] ?? 0);
   return probability;
+}
+
+/** AV1 row/column MV scans stop rather than reusing the last in-frame cell. */
+export function nextMvScanPosition(origin: number, offset: number, end: number): number | null {
+  const position = origin + offset;
+  return position < end ? position : null;
 }
 
 function fillSpan(array: Uint8Array | Int8Array, start: number, length: number, value: number): void {

@@ -72,7 +72,7 @@ import { detectFormat, HeifFile } from 'heif-js/detect';
 
 ## 资源限制
 
-解析不可信图片时默认启用尺寸、像素数、item、extent、引用深度和累计解码量限制。
+解析不可信图片时默认启用尺寸、像素数、item、extent、HEVC NAL 数量、引用深度和累计解码量限制。
 处理超大图片时可以按需放宽：
 
 ```ts
@@ -81,6 +81,7 @@ const image = decode(binary, {
   maxPixels: 120_000_000,
   maxTotalPixels: 240_000_000,
   maxTotalItemBytes: 768 * 1024 * 1024,
+  maxNals: 100_000,
 });
 ```
 

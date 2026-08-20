@@ -20,6 +20,7 @@ import type { DeblockInfo } from './deblock.ts';
 import { debugEnabled, debugValue, debugWrite } from '../debug.ts';
 import { assertDimensions, resolveDecodeLimits } from '../limits.ts';
 import type { DecodeOptions, ResolvedDecodeLimits } from '../limits.ts';
+import { checkedSliceQp, sliceSubstreamStarts, validateSaoOffsetScale } from './guards.ts';
 
 interface HevcDebugOptions {
   cabac: CabacDebugOptions;
@@ -99,7 +100,12 @@ export class HevcDecoder {
           frame.bitDepth !== first.bitDepth)) {
         throw new Error('HEVC: separate colour planes have inconsistent dimensions or bit depths');
       }
-      const output = new DecodedFrame(first.width, first.height, first.bitDepth, CHROMA_444);
+      // Match the per-plane padding so the full-buffer copies below line up.
+      const sourceLuma = decoded[0]!.luma;
+      const output = new DecodedFrame(
+        first.width, first.height, first.bitDepth, CHROMA_444, first.chromaBitDepth,
+        sourceLuma.stride - sourceLuma.width,
+      );
       for (let plane = 0; plane < 3; plane++) output.planes[plane]!.data.set(decoded[plane]!.luma.data);
       return output;
     }
@@ -340,13 +346,16 @@ class SliceDecoder {
     this.adjustEntryPointOffsets(nal, dataStart, entryPointOffsets);
 
     // ---------- frame setup ----------
+    // Edge CTUs of pictures whose size is not a multiple of the coding grid
+    // decode partial blocks; padding keeps their overhang from wrapping into
+    // the following row. Spec cap for a CTB is 64; a few extra columns/rows
+    // also absorb deblock filtering taps past the last real sample.
+    const ctbPad = Math.min(1 << sps.log2CtbSize, 64) + 8;
     const frame = new DecodedFrame(
-      sps.width, sps.height, sps.bitDepthLuma, this.chromaFormat, sps.bitDepthChroma,
+      sps.width, sps.height, sps.bitDepthLuma, this.chromaFormat, sps.bitDepthChroma, ctbPad,
     );
     this.frame = frame;
-    const qpBdOffsetY = (sps.bitDepthLuma - 8) * 6;
-    const qpBdOffsetC = (sps.bitDepthChroma - 8) * 6;
-    const initQp = 26 + pps.initQpMinus26 + sliceQpDelta;
+    const initQp = checkedSliceQp(sps.bitDepthLuma, pps.initQpMinus26, sliceQpDelta);
     this.sliceQpY = initQp;
     this.sliceStartX = 0; this.sliceStartY = 0;
     this.curQp = initQp;
@@ -483,6 +492,7 @@ class SliceDecoder {
       saoChroma ||= header.saoChroma;
       this.decodeAdditionalSlice(header, scanOrder, ctbCols, ctbRows, ctbSize, tileColBd, tileRowBd, saoParams);
     }
+    this.assertSliceCoverage(ctbCols, ctbRows, ctbSize);
 
     const dbInfo: DeblockInfo = {
       qpMap: this.qpMap, widthInMinCbs: this.widthInMinCbs, minCbLog2: sps.log2MinCbSize,
@@ -505,6 +515,18 @@ class SliceDecoder {
         this.sliceIdMap, lfAcrossSlices);
     }
     return frame;
+  }
+
+  private assertSliceCoverage(ctbCols: number, ctbRows: number, ctbSize: number): void {
+    for (let row = 0; row < ctbRows; row++) {
+      for (let col = 0; col < ctbCols; col++) {
+        const gridX = (col * ctbSize) >> 2;
+        const gridY = (row * ctbSize) >> 2;
+        if (this.sliceIdMap[gridY * this.gridW + gridX] === -1) {
+          throw new Error(`HEVC: slice segments do not cover CTB ${row * ctbCols + col}`);
+        }
+      }
+    }
   }
 
   private parseSliceHeader(nal: HevcNal, inherited: SliceHeader): SliceHeader {
@@ -645,8 +667,10 @@ class SliceDecoder {
     this.sliceCbQp = h.sliceCbQp; this.sliceCrQp = h.sliceCrQp;
     this.cuChromaQpOffsetEnabled = h.cuChromaQpOffsetEnabled;
     this.cuChromaQpOffsetCoded = false; this.cuCbQpOffset = 0; this.cuCrQpOffset = 0;
+    validateSaoOffsetScale(h.pps.log2SaoOffsetScaleLuma, h.sps.bitDepthLuma, 'luma');
+    validateSaoOffsetScale(h.pps.log2SaoOffsetScaleChroma, h.sps.bitDepthChroma, 'chroma');
     if (!h.dependent) {
-      this.sliceQpY = 26 + h.pps.initQpMinus26 + h.sliceQpDelta;
+      this.sliceQpY = checkedSliceQp(h.sps.bitDepthLuma, h.pps.initQpMinus26, h.sliceQpDelta);
       this.sliceStartX = (h.address % ctbCols) * ctbSize;
       this.sliceStartY = Math.floor(h.address / ctbCols) * ctbSize;
       this.curQp = this.sliceQpY; this.prevQp = this.sliceQpY;
@@ -720,14 +744,19 @@ class SliceDecoder {
     if (startStream < 0) throw new Error(`HEVC: invalid slice_segment_address ${h.address}`);
     const inheritedContexts = h.dependent ? this.cabac.saveContexts() : null;
     const wavefrontContexts = new Map<number, { states: Uint8Array; mps: Uint8Array }>();
+    const starts = sliceSubstreamStarts(h.dataStart, h.entryPointOffsets, h.nal.rbsp.length);
+    if (starts.length > streams.length - startStream) {
+      throw new Error('HEVC: slice has more entry points than remaining tile/WPP substreams');
+    }
 
-    for (let streamIndex = startStream, entry = 0; streamIndex < streams.length; streamIndex++, entry++) {
+    for (let entry = 0; entry < starts.length; entry++) {
+      const streamIndex = startStream + entry;
       const stream = streams[streamIndex]!;
-      const start = entry === 0 ? h.dataStart : h.dataStart + (h.entryPointOffsets[entry - 1] ?? 0);
+      const start = starts[entry]!;
       this.cabac = new Cabac(h.nal.rbsp, start, this.debug.cabac);
       if (entry === 0 && inheritedContexts) {
         this.cabac.loadContexts(inheritedContexts);
-      } else if (h.pps.entropyCodingSync && stream.tileLeft === 0 && stream.rowInTile > 0 && wavefrontContexts.has(stream.tileId)) {
+      } else if (h.pps.entropyCodingSync && stream.rowInTile > 0 && wavefrontContexts.has(stream.tileId)) {
         const sync = wavefrontContexts.get(stream.tileId)!;
         if (this.debug.trace) this.tr('wpp_load_ctx8', `${sync.states[CTX.PART_MODE]}/${sync.mps[CTX.PART_MODE]}`);
         this.cabac.loadContexts(sync);
@@ -752,12 +781,14 @@ class SliceDecoder {
           this.readSao(ctbAddr, noLeft, noTop, saoParams, h.saoLuma, h.saoChroma, ctbCols);
         } else saoParams[ctbAddr] = NO_SAO;
         this.decodeCtu(x, y, h.sps.log2CtbSize, 0);
-        if (h.pps.entropyCodingSync && stream.tileLeft === 0 && pos === first + 1) {
+        if (h.pps.entropyCodingSync && pos === first + 1) {
           const sync = this.cabac.saveContexts();
           if (this.debug.trace) this.tr('wpp_save_ctx8', `${sync.states[CTX.PART_MODE]}/${sync.mps[CTX.PART_MODE]}`);
           wavefrontContexts.set(stream.tileId, sync);
         }
-        if (this.cabac.decodeTerminate() === 1) return;
+        // A terminating bin ends this subset. The number of subsets processed
+        // is bounded by the entry points signalled in this slice header.
+        if (this.cabac.decodeTerminate() === 1) break;
       }
     }
   }
@@ -965,8 +996,12 @@ class SliceDecoder {
       if (this.debug.trace) this.tr('mode', mode);
       modes[puIdx] = mode;
       for (let y = 0; y < (puSize >> 2); y++) {
+        const gy = (py >> 2) + y;
+        if (gy >= this.gridH) break;
         for (let x = 0; x < (puSize >> 2); x++) {
-          this.intraPredMode[((py >> 2) + y) * this.gridW + (px >> 2) + x] = mode;
+          const gx = (px >> 2) + x;
+          if (gx >= this.gridW) break;
+          this.intraPredMode[gy * this.gridW + gx] = mode;
         }
       }
     }
@@ -992,8 +1027,12 @@ class SliceDecoder {
       let mc = chromaPredMode(lumaForChroma, chromaIdx[puIdx]!);
       if (this.chromaFormat === CHROMA_422) mc = CHROMA_422_MODE[mc]!;
       for (let y = 0; y < (puSize >> 2); y++) {
+        const gy = (py >> 2) + y;
+        if (gy >= this.gridH) break;
         for (let x = 0; x < (puSize >> 2); x++) {
-          const gi = ((py >> 2) + y) * this.gridW + (px >> 2) + x;
+          const gx = (px >> 2) + x;
+          if (gx >= this.gridW) break;
+          const gi = gy * this.gridW + gx;
           this.intraPredModeC[gi] = mc;
           this.intraChromaDerived[gi] = chromaIdx[puIdx] === 4 ? 1 : 0;
         }
@@ -1326,7 +1365,11 @@ class SliceDecoder {
     const qpPred = (qpa + qpb + 1) >> 1;
     const qpBd = (sps.bitDepthLuma - 8) * 6;
     const mod = 52 + qpBd;
-    this.curQp = ((qpPred + this.cuQpDelta + 52 + 2 * qpBd) % mod) - qpBd;
+    // cu_qp_delta syntax is unbounded; a non-positive JS modulo would produce
+    // a negative QP (and undefined table lookups downstream), so pin the raw
+    // value into [0, mod) before applying the bit-depth offset.
+    const raw = (qpPred + this.cuQpDelta + 52 + 2 * qpBd) % mod;
+    this.curQp = (raw < 0 ? raw + mod : raw) - qpBd;
 
     const spanCb = Math.max(1, 1 << (this.curCuLog2 - minCbLog2));
     const cbX0 = cuX >> minCbLog2, cbY0 = cuY >> minCbLog2;

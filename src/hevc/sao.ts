@@ -46,7 +46,8 @@ export function applySao(
   for (let ctbY = 0; ctbY < ctbRows; ctbY++) {
     for (let ctbX = 0; ctbX < ctbCols; ctbX++) {
       const ctbAddr = ctbY * ctbCols + ctbX;
-      const p = params[ctbAddr]!;
+      const p = params[ctbAddr];
+      if (!p) throw new Error(`HEVC: missing SAO parameters for CTB ${ctbAddr}`);
       const x0 = ctbX * ctbSize, y0 = ctbY * ctbSize;
 
       // availability of neighbors for filtering across CTB edges

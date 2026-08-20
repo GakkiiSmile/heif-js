@@ -9,8 +9,8 @@ export const decodeHevcItem: ItemCodecDecoder = (
   item, limits, colorManagement, output,
 ): DecodedItemImage => {
   if (!item.config) throw new DecodeError('MISSING_CONFIG', 'HEVC image item has no hvcC configuration');
-  const config = parseHvcC(item.config);
-  const itemNals = nalsFromLengthPrefixed(item.data, config.lengthSize);
+  const config = parseHvcC(item.config, limits.maxNals);
+  const itemNals = nalsFromLengthPrefixed(item.data, config.lengthSize, limits.maxNals);
   const decoder = new HevcDecoder(limits);
   decoder.registerParamSets(config.paramSets);
   decoder.registerParamSets(itemNals);

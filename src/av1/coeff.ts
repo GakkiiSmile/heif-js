@@ -260,10 +260,12 @@ function getLowContext(levels: Uint8Array, stride: number, txClass: number,
   return (offset + (magnitude > 512 ? 4 : (magnitude + 64) >> 7)) | (highMagnitude << 8);
 }
 
-function getDcSignContext(above: Uint8Array, left: Uint8Array, width: number, height: number): number {
+export function getDcSignContext(above: Uint8Array, left: Uint8Array, width: number, height: number): number {
   let sum = -width - height;
-  for (let i = 0; i < width; i++) sum += above[i]! >> 6;
-  for (let i = 0; i < height; i++) sum += left[i]! >> 6;
+  // Transform units straddling the frame edge have truncated above/left
+  // subarrays; the spec initializes the missing edge context to 0x40 (= 1).
+  for (let i = 0; i < width; i++) sum += (above[i] ?? 0x40) >> 6;
+  for (let i = 0; i < height; i++) sum += (left[i] ?? 0x40) >> 6;
   return +(sum !== 0) + +(sum > 0);
 }
 

@@ -22,7 +22,9 @@ export class BitReader {
       const bitPos = this.pos + i;
       const byteI = bitPos >> 3;
       const bit = (this.u8[byteI]! >> (7 - (bitPos & 7))) & 1;
-      v = (v << 1) | bit;
+      // Multiply instead of shifting so a full 32-bit read stays unsigned;
+      // entry-point offsets are allowed to use the complete u(32) range.
+      v = v * 2 + bit;
     }
     this.pos += n;
     return v;

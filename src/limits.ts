@@ -25,6 +25,8 @@ export interface DecodeOptions {
   maxBoxes?: number;
   /** Maximum recursive derived/auxiliary-item depth. Default: 128. */
   maxReferenceDepth?: number;
+  /** Maximum NAL units materialized from one hvcC configuration or coded item. Default: 65,536. */
+  maxNals?: number;
 }
 
 export interface ResolvedDecodeLimits {
@@ -38,6 +40,7 @@ export interface ResolvedDecodeLimits {
   maxTotalItemBytes: number;
   maxBoxes: number;
   maxReferenceDepth: number;
+  maxNals: number;
 }
 
 export const DEFAULT_DECODE_LIMITS: Readonly<ResolvedDecodeLimits> = Object.freeze({
@@ -51,6 +54,7 @@ export const DEFAULT_DECODE_LIMITS: Readonly<ResolvedDecodeLimits> = Object.free
   maxTotalItemBytes: 512 * 1024 * 1024,
   maxBoxes: 262_144,
   maxReferenceDepth: 128,
+  maxNals: 65_536,
 });
 
 export class ResourceLimitError extends Error {

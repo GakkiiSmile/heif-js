@@ -1,5 +1,14 @@
 /** HEVC NAL unit handling: hvcC parsing, length-prefixed extraction, RBSP unescaping. */
 
+import { DEFAULT_DECODE_LIMITS, ResourceLimitError } from '../limits.ts';
+
+/** Each extracted NAL becomes an object plus a payload view; bound the count. */
+function checkNalCount(count: number, maxNals: number): void {
+  if (count > maxNals) {
+    throw new ResourceLimitError(`HEVC: NAL count exceeds configured limit ${maxNals}`);
+  }
+}
+
 export const NAL_VPS = 32, NAL_SPS = 33, NAL_PPS = 34, NAL_AUD = 35,
   NAL_PREFIX_SEI = 39, NAL_SUFFIX_SEI = 40, NAL_SLICE_TRAIL_N = 0, NAL_SLICE_TRAIL_R = 1,
   NAL_SLICE_TSA_N = 2, NAL_SLICE_TSA_R = 3, NAL_SLICE_STSA = 4, NAL_SLICE_RADL = 6,
@@ -100,7 +109,7 @@ export interface HvcC {
   paramSets: HevcNal[];
 }
 
-export function parseHvcC(payload: Uint8Array): HvcC {
+export function parseHvcC(payload: Uint8Array, maxNals = DEFAULT_DECODE_LIMITS.maxNals): HvcC {
   payload = snapshotSharedInput(payload);
   // layout: [0] version; [1] profile info; [2..5] compat flags; [6..11] constraint flags;
   // [12] level_idc; [13..14] min_spatial_segmentation; [15] parallelismType;
@@ -126,6 +135,7 @@ export function parseHvcC(payload: Uint8Array): HvcC {
       const length = (payload[pos]! << 8) | payload[pos + 1]!;
       pos += 2;
       if (length < 2 || pos + length > payload.length) throw new Error('HEVC: truncated hvcC NAL unit');
+      checkNalCount(paramSets.length + 1, maxNals);
       const nal = payload.subarray(pos, pos + length);
       validateNalHeader(nal);
       const actualType = (nal[0]! >> 1) & 0x3f;
@@ -139,7 +149,9 @@ export function parseHvcC(payload: Uint8Array): HvcC {
 }
 
 /** Extract NAL units from an hvc1 item payload (length-prefixed). */
-export function nalsFromLengthPrefixed(u8: Uint8Array, lengthSize: number): HevcNal[] {
+export function nalsFromLengthPrefixed(
+  u8: Uint8Array, lengthSize: number, maxNals = DEFAULT_DECODE_LIMITS.maxNals,
+): HevcNal[] {
   u8 = snapshotSharedInput(u8);
   if (lengthSize !== 1 && lengthSize !== 2 && lengthSize !== 4) {
     throw new Error(`HEVC: invalid NAL length size ${lengthSize}`);
@@ -151,6 +163,7 @@ export function nalsFromLengthPrefixed(u8: Uint8Array, lengthSize: number): Hevc
     for (let i = 0; i < lengthSize; i++) len = len * 256 + u8[pos + i];
     pos += lengthSize;
     if (len < 2 || pos + len > u8.length) throw new Error('HEVC: invalid length-prefixed NAL unit');
+    checkNalCount(out.length + 1, maxNals);
     const nal = u8.subarray(pos, pos + len);
     pos += len;
     validateNalHeader(nal);
@@ -162,14 +175,18 @@ export function nalsFromLengthPrefixed(u8: Uint8Array, lengthSize: number): Hevc
 }
 
 /** Extract NAL units from an Annex-B stream (00 00 01 start codes). */
-export function nalsFromAnnexB(u8: Uint8Array): HevcNal[] {
+export function nalsFromAnnexB(u8: Uint8Array, maxNals = DEFAULT_DECODE_LIMITS.maxNals): HevcNal[] {
   u8 = snapshotSharedInput(u8);
   const out: HevcNal[] = [];
-  let starts: number[] = [];
+  const starts: number[] = [];
+  const addStart = (start: number): void => {
+    checkNalCount(starts.length + 1, maxNals);
+    starts.push(start);
+  };
   let i = 0;
   while (i + 3 <= u8.length) {
-    if (u8[i] === 0 && u8[i + 1] === 0 && (u8[i + 2] === 1)) { starts.push(i + 3); i += 3; }
-    else if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 0 && i + 4 <= u8.length && u8[i + 3] === 1) { starts.push(i + 4); i += 4; }
+    if (u8[i] === 0 && u8[i + 1] === 0 && (u8[i + 2] === 1)) { addStart(i + 3); i += 3; }
+    else if (u8[i] === 0 && u8[i + 1] === 0 && u8[i + 2] === 0 && i + 4 <= u8.length && u8[i + 3] === 1) { addStart(i + 4); i += 4; }
     else i++;
   }
   for (let s = 0; s < starts.length; s++) {
